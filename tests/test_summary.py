@@ -144,7 +144,6 @@ class TestBudgetSummary(unittest.TestCase):
                       "content": "error test failed " * 600}]}},
                 rec("assistant", f"Final patch for feature_{i}", uid=f"a{i}")
             ]
-        ]
         preview, _ = cb.fit_context(records, 23000, max_tool_chars=500,
                                     summary_reserve_tokens=3500)
         retained = {r["uuid"] for r in preview}
