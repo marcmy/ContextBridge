@@ -89,7 +89,7 @@ def _note(template: dict, body: str) -> dict:
     return r
 
 
-def _omitted_note(prefix: list[dict], clipped: int) -> str:
+def _omitted_note(prefix: list[dict], clipped: int, *, include_requests: bool = True) -> str:
     requests = [p.replace("\n", " ")[:200] for r in prefix if (p := human_prompt(r))]
     requests = requests[-12:]
     report = (
@@ -99,7 +99,7 @@ def _omitted_note(prefix: list[dict], clipped: int) -> str:
         "consult the repository and source rollouts before assuming old decisions.\n"
         f"Excluded {len(prefix)} earlier records. Shortened {clipped} large message/tool blocks.\n"
     )
-    if requests:
+    if requests and include_requests:
         report += "\nSelected earlier user requests (excerpts, newest last):\n" + "\n".join(
             "- " + item for item in requests
         )
@@ -188,7 +188,7 @@ def fit_context(records: list[dict], budget: int, max_tool_chars: int = 3000, *,
     kept_ids = {id(r) for group in selected for r in group}
     omitted = [r for group in groups for r in group if id(r) not in kept_ids]
     omitted = prelude + omitted
-    body = _omitted_note(omitted, clipped)
+    body = _omitted_note(omitted, clipped, include_requests=not bool(historical_summary))
     if historical_summary:
         body += "\n\n" + historical_summary
     note = _note(selected[0][0], body)
