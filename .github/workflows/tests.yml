@@ -2,20 +2,29 @@ name: Tests
 
 on:
   push:
-    branches: [main, feat/semantic-history-summary]
+    branches: [main]
   pull_request:
 
 jobs:
   unittest:
-    name: Python unit tests (${{ matrix.os }})
+    name: Python ${{ matrix.python }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        python: ['3.12', '3.14']
+    env:
+      QT_QPA_PLATFORM: offscreen
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - run: python -m unittest discover -s tests -p 'test_*.py' -v
+          python-version: ${{ matrix.python }}
+      - name: Qt system libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1 libglib2.0-0
+      - run: pip install -e .[gui]
+      - run: python -m unittest discover -s tests -p "test_*.py" -v
+      - name: The app starts
+        run: python -m contextbridge --codex-home .sandbox/codex --claude-home .sandbox/claude --app-home .sandbox/app gui --smoke-test

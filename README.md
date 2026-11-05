@@ -1,4 +1,89 @@
-# codeximporterforclaude
+# ContextBridge
+
+*One workflow. Any AI agent.*
+
+Switch between OpenAI Codex and Claude Code without losing development context, duplicating
+conversations or explaining a project again. ContextBridge is a Windows-first desktop app
+(Python and PySide6) that finds your conversations in both agents, tracks how they relate, and
+moves work between them safely.
+
+![The session browser](docs/screenshots/sessions.png)
+
+## Install and run
+
+```powershell
+python -m venv .venv
+.venv\Scripts\pip install -e .[gui]
+.venv\Scripts\contextbridge-gui
+```
+
+You can also double-click `run_contextbridge.pyw` once `.venv` exists. Python 3.12 or newer is
+required. Below 3.14, the `zstandard` package reads compressed Codex rollouts; it is installed
+automatically.
+
+To try it without touching your real sessions, point it at copies:
+
+```powershell
+.venv\Scripts\contextbridge --codex-home D:\try\.codex --claude-home D:\try\.claude --app-home D:\try\app gui
+```
+
+## A handoff
+
+1. Find a conversation under **Sessions**. Conversations are grouped by project, and rollout
+   revisions and Codex's internal agents are already folded away.
+2. Select **Send to Claude** or **Send to Codex**.
+3. **Review** what state the two sides are in, and pick a transfer type. Anything that would
+   overwrite work or merge diverged histories is disabled, with the reason beside it.
+4. **Context**: set the budget and how earlier history is kept. The numbers recalculate as you
+   change them, without writing anything or making a billable call.
+5. **Confirm**, then read the report. **Open in Claude** or **Open in Codex** resumes the
+   session in a terminal, or you can copy the command.
+
+A completed transfer moves conversation history, nothing else. The destination agent still
+needs the right code, branch and dependencies, so each handoff reports the repository's branch,
+HEAD and uncommitted changes. ContextBridge never resets, cleans or stashes anything.
+
+![Reviewing a diverged conversation](docs/screenshots/review-diverged.png)
+
+## What each status means
+
+The status is always relative to the selected session.
+
+| Status | Meaning | What you're offered |
+|---|---|---|
+| Not transferred | No recorded link to the other agent | A new session |
+| Imported, unchanged | Neither side moved since the last checkpoint | Nothing to do |
+| Source advanced | This session has work the other side lacks | Add only that work |
+| Destination advanced | The other side has work this one lacks | Send from the other side |
+| Both advanced | They diverged | A separate continuation; never a merge |
+| Destination missing | The linked session is gone | A new session |
+| Source modified | History changed after it was transferred, for example by a revert | A separate continuation |
+| Possible duplicate | Recorded provenance shows this is a copy | Review it under Imports and cleanup |
+| Ambiguous lineage | Records disagree or the peer changed unexpectedly | Nothing by default; you choose |
+
+Titles and folders never decide any of this. See [how lineage works](docs/ARCHITECTURE.md) and
+[what has and has not been verified](docs/ARCHITECTURE.md#verification).
+
+## Command line
+
+The desktop app and `contextbridge` share one backend:
+
+```powershell
+contextbridge sessions --project MyRepo
+contextbridge show 01a1ab29
+contextbridge plan 01a1ab29 --to claude      # preview: no writes, no billable calls
+contextbridge send 01a1ab29 --to claude --yes
+contextbridge transfers
+contextbridge duplicates
+```
+
+The original importer below still works and uses the same converter, so
+`python src/codex_import.py` keeps its `list`, `import`, `status`, `repair`, `uninstall` and
+`move-account` commands.
+
+---
+
+# The Codex-to-Claude importer
 
 Import OpenAI Codex conversation history into Claude Code, so old Codex threads
 show up in `/resume` and can be continued.
@@ -18,10 +103,10 @@ the retained ancestor JSONL prefixes in order, respecting byte offsets. If an
 ancestor is unavailable, the import is **skipped**, rather than silently
 importing an incomplete conversation.
 
-The filesystem selection is a fallback and does not yet consult the current
-rollout path in Codex's SQLite index. This version only reads uncompressed
-`.jsonl` rollouts; compressed `.jsonl.zst` ancestors require a future
-reader. If a thread was imported before a revert, rerunning the importer will
+This command-line selection reads the filesystem; ContextBridge also consults
+Codex's state database, which names each thread's current rollout. Both read
+compressed `.jsonl.zst` rollouts, which is how Codex stores settled history. If a
+thread was imported before a revert, rerunning the importer will
 **not** append a different rollout revision to the existing Claude transcript:
 use `import --force` to import the newest revision as a separate session.
 
@@ -287,14 +372,17 @@ clears dead sidebar rows whose transcript no longer exists.
 
 ## Tests
 
-```sh
-python3 tests/test_convert.py
+```powershell
+python -m unittest discover -s tests -p "test_*.py"
 ```
 
-28 fixture tests pinning the parts that were expensive to work out: which Codex
-records carry content, how machine preambles are split from what the user typed, the
-tool_use/tool_result invariant, the two path rules, and appending newer Codex turns to
-a thread already in Claude.
+| File | Covers |
+|---|---|
+| `tests/test_convert.py`, `tests/test_summary.py` | The converter, budgeting and summaries. These predate ContextBridge and are preserved as written. |
+| `tests/test_lineage_scenarios.py` | The acceptance scenarios, including Codex to Claude to Codex to Claude, on synthetic homes. |
+| `tests/test_gui.py` | The real window and dialog, driven offscreen. Skipped without PySide6. |
+| `tests/test_cli.py` | Both command lines. |
+| `tests/test_real_codex.py` | The real `codex app-server` in an isolated `CODEX_HOME`. Set `CONTEXTBRIDGE_REAL_CODEX=1` to run it; it makes no model calls. |
 
 ## What doesn't survive
 
@@ -312,8 +400,12 @@ cwd — comes across.
 ## Layout
 
 ```
-src/codex_import.py    the converter
-src/desktop_register.py  writes the desktop app's session cards
-schema/skel.py         JSONL structure dumper used to do the diff
-schema/*.skel.txt      the dumps both formats were read from
+src/codex_import.py        the converter, ledger and original CLI
+src/context_budget.py      bounded working views
+src/history_summary.py     evidence indexes and AI summaries
+src/desktop_register.py    the Claude desktop app's session cards
+src/contextbridge/         discovery, lineage database, handoffs, reports, CLI
+src/contextbridge/ui/      the PySide6 interface
+docs/ARCHITECTURE.md       lineage model, Codex findings, limitations, verification
+schema/                    JSONL structure dumps both formats were read from
 ```
