@@ -82,6 +82,45 @@ Nothing is read from Codex except `~/.codex/sessions/` and the import ledger. No
 existing is overwritten: a new thread gets a fresh session UUID, and an existing
 transcript is only ever appended to, after a backup copy is saved.
 
+## Keep a large import within Claude's context window
+
+Full Codex transcripts may be much larger than Claude's context window.
+The optional `--context-budget` creates a **lossy working-session view**:
+it preserves recent complete human turns, shortens large historical tool
+traffic while keeping tool-use/result pairs valid, and inserts an explicit
+background note containing selected earlier user-request excerpts. When
+even the last turn is too large, it retains its user request and most recent
+assistant text instead of invalid partial tool calls.
+
+The original `~/.codex/sessions/` files are never changed. This mode is
+**not an AI-generated summary** and may omit earlier project decisions. Claude
+can re-read the local repository and the original source rollouts as needed.
+
+To safely remake ONE existing imported session (rather than uninstalling all
+imports), close Claude Code/Desktop first and preview:
+
+```powershell
+python3 src/codex_import.py import --session 01a1ab29 --mode faithful --keep-developer --context-budget 100000 --replace --dry-run
+```
+
+Then remove `--dry-run` to write. `--replace` automatically backs up the
+previous imported Claude transcript in `~/.claude/codex-import-backups/`,
+preserves its Claude session UUID, and updates its import ledger. It **refuses**
+to replace a transcript that Claude has continued with native assistant turns,
+or any transcript lacking the importer provenance marker. It also requires a
+single session ID; `--all --replace` is forbidden.
+
+The token estimate is deliberately conservative (UTF-8 bytes / 2 plus
+overhead), but **not Claude's real token counter**. A budget of 100,000 estimated
+message tokens leaves room in a standard 200K context for tool definitions,
+instructions, and continuing the conversation. Check Claude's context meter
+after re-opening; lower the budget if necessary.
+
+Incremental synchronization is disabled for budgeted imports: rerun the same
+`--replace --context-budget` command to refresh the bounded view from Codex.
+If you already continued the imported conversation in Claude, preserve that
+Claude work and create a *separate* bounded import using `--force` instead.
+
 ## When a thread moves on in Codex
 
 A thread can be in both apps and keep going in Codex:
