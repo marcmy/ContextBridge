@@ -1,0 +1,21 @@
+name: Tests
+
+on:
+  push:
+    branches: [fix/codex-revisions-and-subagents]
+  pull_request:
+
+jobs:
+  unittest:
+    name: Python unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python tests/test_convert.py
