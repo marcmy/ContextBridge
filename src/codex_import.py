@@ -81,6 +81,11 @@ WRAPPER_RE = re.compile(rf"<({_TAGS})\b.*?</\1>|<({_TAGS})\b[^>]*/?>", re.S | re
 # Codex separates its preamble from the real prompt with this header. When present
 # it is authoritative — everything after it is what the human actually typed.
 REQUEST_RE = re.compile(r"^#{1,6}[ \t]*My request:?[ \t]*$", re.M | re.I)
+# Codex internal reviewer/app handoffs can be logged as user-role messages.
+# Do not present these as something the human typed.
+INTERNAL_PROMPT_RE = re.compile(
+    r"^\s*(?:<external_codex_apps_[\w-]+>|"
+    r"The following is the Codex agent history\b)", re.I)
 
 # "# Files pasted by the user:" … runs until the next top-level heading.
 FILES_BLOCK_RE = re.compile(
@@ -103,6 +108,8 @@ MANIFEST_RE = re.compile(r"^\S.{0,80}?:\s*[~/]\S+$")
 def split_user_message(raw: str) -> tuple[str, str]:
     """Split a Codex user turn into (background, human). Either may be empty."""
     raw = raw or ""
+    if INTERNAL_PROMPT_RE.match(raw):
+        return raw.strip(), ""
     m = REQUEST_RE.search(raw)
     if m:
         return raw[:m.start()].strip(), raw[m.end():].strip()
@@ -288,8 +295,34 @@ def round_tripped_ids() -> dict[str, str]:
             for r in recs if r.get("imported_thread_id")}
 
 
+# Codex's thread/revert writes a new immutable rollout with the SAME thread id
+# and a new rollout id after an underscore. Its history_base names the retained
+# ancestor prefix. Importing every file independently duplicates one conversation.
+ROLLOUT_RE = re.compile(
+    r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-"
+    r"([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\.jsonl$", re.I)
+
+
+def rollout_id(path: Path) -> str | None:
+    m = ROLLOUT_RE.match(path.name)
+    return (m.group(2) or m.group(1)) if m else None
+
+
+def is_internal_session(meta: dict) -> bool:
+    """Detect Codex subagents and internal reviewers from session metadata."""
+    for source in (meta.get("source"), meta.get("thread_source")):
+        if isinstance(source, str) and source.lower() in ("subagent", "internal", "guardian"):
+            return True
+        if isinstance(source, dict) and (
+            "subagent" in source or "subAgent" in source or "internal" in source
+            or source.get("type") in ("subagent", "internal", "guardian")
+        ):
+            return True
+    return False
+
+
 def summarize(path: Path) -> dict | None:
-    """Cheap header read: metadata + a usable title, without parsing the whole file."""
+    """Read header and title while retaining fields needed for rollout lineage."""
     meta, n = None, 0
     candidates: list[str] = []
     with path.open(errors="replace") as fh:
@@ -313,21 +346,80 @@ def summarize(path: Path) -> dict | None:
     if not meta:
         return None
     return {"path": path, "id": meta.get("id") or meta.get("session_id"),
+            "rollout_id": rollout_id(path),
+            "history_base": meta.get("history_base"),
+            "internal": is_internal_session(meta),
             "cwd": meta.get("cwd", ""), "ts": meta.get("timestamp", ""),
             "originator": meta.get("originator", ""), "lines": n,
             "first_user": next((t for t in (clean_title(c) for c in candidates) if t), "")}
 
 
-def discover(root: Path) -> list[dict]:
-    out = []
+def resolve_lineage(sess: dict, rollouts: dict[str, dict]) -> None:
+    """Find retained ancestor prefixes, oldest first; never silently truncate."""
+    chain = [(sess["path"], None)]
+    visited = {sess["rollout_id"]}
+    current = sess
+    while isinstance(current.get("history_base"), dict):
+        base = current["history_base"]
+        ancestor_id = base.get("thread_id")
+        ancestor = rollouts.get(ancestor_id)
+        if not ancestor or ancestor_id in visited:
+            sess["lineage_error"] = f"missing/cyclic ancestor rollout {ancestor_id}"
+            return
+        try:
+            end = int(base["end_byte_offset"])
+        except (KeyError, TypeError, ValueError):
+            sess["lineage_error"] = f"missing byte cutoff for ancestor {ancestor_id}"
+            return
+        if end < 1:
+            sess["lineage_error"] = f"invalid ancestor cutoff {end}"
+            return
+        visited.add(ancestor_id)
+        chain.append((ancestor["path"], end))
+        current = ancestor
+    sess["lineage"] = list(reversed(chain))
+
+
+def read_lineage(sess: dict) -> list[dict]:
+    """Reconstruct content from each immutable ancestor prefix and final rollout."""
+    if sess.get("lineage_error"):
+        raise ValueError(sess["lineage_error"])
+    records = []
+    for path, cutoff in sess.get("lineage", [(sess["path"], None)]):
+        raw = path.read_bytes()
+        if cutoff is not None:
+            if cutoff > len(raw) or raw[cutoff - 1:cutoff] != b"\n":
+                raise ValueError(f"invalid history_base byte cutoff {cutoff} in {path}")
+            raw = raw[:cutoff]
+        records.extend(r for _, r in records_from(raw))
+    return records
+
+
+def discover(root: Path, include_internal: bool = False) -> list[dict]:
+    all_sessions = []
     for p in sorted(root.rglob("*.jsonl")):
         s = summarize(p)
         if s:
-            out.append(s)
+            all_sessions.append(s)
+    rollouts = {s["rollout_id"]: s for s in all_sessions if s["rollout_id"]}
+    # One logical thread may have many immutable reverted revisions. The newest
+    # rollout is the best available filesystem fallback without Codex's SQLite index.
+    by_thread = {}
+    for s in sorted(all_sessions, key=lambda s: (s["ts"], s["path"].name)):
+        if s["internal"] and not include_internal:
+            continue
+        key = s["id"] or str(s["path"])
+        by_thread[key] = s
+    out = list(by_thread.values())
+    counts = {}
+    for s in all_sessions:
+        counts[s["id"]] = counts.get(s["id"], 0) + 1
     ledger = round_tripped_ids()
     for s in out:
+        s["revisions"] = counts.get(s["id"], 1)
         s["round_trip"] = ledger.get(s["id"] or "", "")
-    out.sort(key=lambda s: s["ts"])
+        resolve_lineage(s, rollouts)
+    out.sort(key=lambda s: (s["ts"], s["path"].name))
     return out
 
 
@@ -684,7 +776,7 @@ def append_codex_turns(sess: dict, data: bytes, start: int, target: Path, *, mod
 # ----------------------------------------------------------------------------- cli
 
 def cmd_list(args):
-    sessions = discover(Path(args.codex_dir))
+    sessions = discover(Path(args.codex_dir), include_internal=args.include_internal)
     if not sessions:
         print(f"No Codex rollouts found under {args.codex_dir}")
         return
@@ -694,6 +786,10 @@ def cmd_list(args):
         tags = []
         if s["round_trip"]:
             tags.append("round-trip from Claude")
+        if s["revisions"] > 1:
+            tags.append(f'{s["revisions"]} revisions; latest selected')
+        if s.get("lineage_error"):
+            tags.append(f'lineage unavailable: {s["lineage_error"]}')
         if s["id"] in done:
             tags.append("synced back" if done[s["id"]].get("kind") == "round-trip"
                         else "already imported")
@@ -706,7 +802,7 @@ def cmd_list(args):
 
 
 def cmd_import(args):
-    sessions = discover(Path(args.codex_dir))
+    sessions = discover(Path(args.codex_dir), include_internal=args.include_internal)
     if args.session:
         sessions = [s for s in sessions if s["id"] and s["id"].startswith(args.session)]
         if not sessions:
@@ -751,9 +847,18 @@ def cmd_import(args):
               "reopen afterwards.\n")
 
     for s in sessions:
+        if s.get("lineage_error"):
+            print(f"skip {s['id'][:8]}  (cannot reconstruct history: "
+                  f"{s['lineage_error']})")
+            continue
+        try:
+            recs = read_lineage(s)
+        except (OSError, ValueError) as err:
+            print(f"skip {s['id'][:8]}  (cannot reconstruct history: {err})")
+            continue
+        # Sync offsets refer to the active rollout only, not concatenated ancestry.
         data = s["path"].read_bytes()
         parsed = records_from(data)
-        recs = [r for _, r in parsed]
         consumed = parsed[-1][0] if parsed else 0
         cwd = s["cwd"] or str(Path.home())
         if not args.no_group_scratch:
@@ -762,8 +867,8 @@ def cmd_import(args):
         if not args.no_banner:
             conv.emit_user(provenance_banner(s, args.mode), s["ts"], meta=True)
         out = conv.run(recs)
-        if not out:
-            print(f"skip {s['id'][:8]}  (no convertible content)")
+        if not has_conversation(conv.stats):
+            print(f"skip {s['id'][:8]}  (no human conversation content)")
             continue
 
         errs = validate(out)
@@ -828,6 +933,11 @@ def cmd_import(args):
         print()
 
 
+def has_conversation(stats: dict) -> bool:
+    """Do not import an internal-only background transcript."""
+    return any(stats[k] for k in ("user", "assistant", "tool_use", "tool_result"))
+
+
 def print_stats(st: dict, errs: list[str]) -> None:
     print(f"    {st['user']} user, {st['assistant']} assistant, "
           f"{st['tool_use']} tool calls, {st['tool_result']} results, "
@@ -848,6 +958,13 @@ def sync_one(s: dict, entry: dict | None, args, version: str, ledger: dict,
              state: dict) -> None:
     """Append Codex turns newer than what Claude already has for this thread."""
     tid = s["id"]
+    # A revert replaces the active rollout and can change/remove earlier turns.
+    # Appending new revision bytes to the old Claude session would corrupt history.
+    if (entry and entry.get("sourceRollout")
+            and Path(entry["sourceRollout"]) != s["path"]):
+        print(f"skip {tid[:8]}  (Codex rollout revision changed; "
+              "use import --force to import the new revision separately)")
+        return
     native = entry is None or entry.get("kind") == "round-trip"
     size = s["path"].stat().st_size
     if entry and entry.get("sourceBytes") == size:
@@ -1232,11 +1349,15 @@ def main():
     ap.add_argument("--claude-dir", default=str(CLAUDE_PROJECTS))
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("list", help="show the Codex sessions available to import")
+    listing = sub.add_parser("list", help="show the Codex sessions available to import")
+    listing.add_argument("--include-internal", action="store_true",
+                         help="include Codex subagents and internal reviewer sessions")
 
     imp = sub.add_parser("import", help="convert Codex sessions into Claude Code transcripts")
     imp.add_argument("--session", help="Codex session id (prefix match)")
     imp.add_argument("--all", action="store_true", help="import every session found")
+    imp.add_argument("--include-internal", action="store_true",
+                     help="also import Codex subagents and internal reviewer sessions")
     imp.add_argument("--mode", choices=["archive", "faithful"], default="archive",
                      help="archive: tool traffic flattened to readable text, always "
                           "safe to resume. faithful: real tool_use/tool_result pairs, "
