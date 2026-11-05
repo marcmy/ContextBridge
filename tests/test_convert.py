@@ -311,6 +311,115 @@ class TestCodexDiscovery(unittest.TestCase):
                 self.assertFalse(ci.has_conversation(conv.stats))
 
 
+class TestContextBudget(unittest.TestCase):
+    """Bounded imports preserve a useful tail without leaking huge tool logs."""
+
+    def build(self, turns=24, tool_bytes=15000):
+        records = []
+        for i in range(turns):
+            records.extend([
+                ri({"type": "message", "role": "user",
+                    "content": [{"type": "input_text",
+                                 "text": f"Implement feature {i}; read its tests"}]}),
+                ri({"type": "custom_tool_call", "call_id": f"call_{i}",
+                    "name": "exec", "input": "cat README.md"}),
+                ri({"type": "custom_tool_call_output", "call_id": f"call_{i}",
+                    "output": [{"type": "input_text", "text": "x" * tool_bytes}]}),
+                ri({"type": "message", "role": "assistant",
+                    "content": [{"type": "output_text",
+                                 "text": f"Implemented feature {i} and verified tests"}]}),
+            ])
+        _, out = convert(records)
+        return out
+
+    def test_preserves_recent_turn_pairs_and_under_budget(self):
+        import context_budget as cb
+        original = self.build()
+        before = ci.validate(original)
+        tail, stats = cb.fit_context(original, 16000, 900)
+        self.assertEqual(before, [])
+        self.assertEqual(ci.validate(tail), [])
+        self.assertLessEqual(cb.estimate_tokens(tail), 16000)
+        self.assertLess(stats["after"], stats["before"])
+        self.assertGreater(stats["omitted"], 0)
+        self.assertGreater(stats["trimmed"], 0)
+        human = [r["message"]["content"] for r in tail
+                 if r.get("type") == "user" and not r.get("isMeta")
+                 and isinstance(r["message"]["content"], str)]
+        self.assertIn("Implement feature 23; read its tests", human)
+        self.assertNotIn("Implement feature 0; read its tests", human)
+        self.assertEqual(len(original), 96)
+        self.assertTrue(any("earlier Codex turns" in str((r.get("message") or {}).get("content", ""))
+                            for r in tail if r.get("isMeta")))
+        # The source converter transcript is NOT modified.
+        self.assertEqual(len(original[2]["message"]["content"][0]["content"]), 15000)
+        self.assertTrue(all("toolUseResult" not in r for r in tail))
+
+    def test_pathological_single_turn_falls_back_to_prose(self):
+        import context_budget as cb
+        records = [
+            ri({"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Fix important component"}]})
+        ]
+        for i in range(100):
+            records.extend([
+                ri({"type": "custom_tool_call", "call_id": f"c{i}", "name": "exec",
+                    "input": "echo check"}),
+                ri({"type": "custom_tool_call_output", "call_id": f"c{i}",
+                    "output": [{"type": "input_text", "text": "y" * 10000}]})
+            ])
+        records.append(ri({"type": "message", "role": "assistant",
+                           "content": [{"type": "output_text",
+                                        "text": "Critical conclusion: fixed the component."}]}))
+        _, out = convert(records)
+        tail, stats = cb.fit_context(out, 6000, 600)
+        self.assertLessEqual(cb.estimate_tokens(tail), 6000)
+        self.assertEqual(ci.validate(tail), [])
+        self.assertTrue(any(r.get("type") == "assistant" for r in tail))
+        self.assertTrue(any("Critical conclusion" in str((r.get("message") or {}).get("content"))
+                            for r in tail))
+        self.assertFalse(any(b.get("type") == "tool_use"
+                             for r in tail for b in (r.get("message") or {}).get("content", [])
+                             if isinstance(b, dict)))
+
+
+class TestSafeReplace(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp_obj = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_obj.cleanup)
+        self.root = Path(self.tmp_obj.name) / "projects"
+        self.root.mkdir()
+        self.target = self.root / "project" / "old.jsonl"
+        self.target.parent.mkdir()
+        self.entry = {"claudeSessionId": "old", "kind": "import"}
+
+    def write(self, model="codex-imported", marker="codex-import"):
+        self.target.write_text("\n".join(json.dumps(r) for r in [
+            {"type": "assistant", "message": {"model": model}},
+            {"type": "custom-title", "importedFrom": marker},
+        ]) + "\n")
+
+    def test_owned_uncontinued_import_is_replacable(self):
+        self.write()
+        ci.verify_replace_target(self.target, self.entry, str(self.root))
+
+    def test_native_claude_turn_is_never_overwritten(self):
+        self.write("claude-opus-4-8")
+        with self.assertRaises(SystemExit):
+            ci.verify_replace_target(self.target, self.entry, str(self.root))
+
+    def test_missing_provenance_is_rejected(self):
+        self.write(marker="not-ours")
+        with self.assertRaises(SystemExit):
+            ci.verify_replace_target(self.target, self.entry, str(self.root))
+
+    def test_outside_project_folder_is_rejected(self):
+        self.write()
+        with self.assertRaises(SystemExit):
+            ci.verify_replace_target(self.target, self.entry, str(self.root / "other"))
+
+
 class TestSync(unittest.TestCase):
     """A thread that moved on in Codex after it reached Claude."""
 
