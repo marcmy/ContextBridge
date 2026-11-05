@@ -7,6 +7,36 @@ Codex can import Claude sessions. Claude Code's own `/import` only moves *config
 (AGENTS.md, subagents, prompts, MCP servers) — it has no path for transcripts.
 This closes that gap.
 
+## Fork fixes: Codex rollout revisions and internal sessions
+
+Codex `thread/revert` creates a new immutable rollout file named
+`rollout-<timestamp>-<thread-id>_<rollout-id>.jsonl`. These are *revisions of
+one logical thread*, not independent conversations. By default, `list` and
+`import --all` now select the newest filesystem revision per thread ID.
+For revisions that expose a `history_base` pointer, the importer reconstructs
+the retained ancestor JSONL prefixes in order, respecting byte offsets. If an
+ancestor is unavailable, the import is **skipped**, rather than silently
+importing an incomplete conversation.
+
+The filesystem selection is a fallback and does not yet consult the current
+rollout path in Codex's SQLite index. This version only reads uncompressed
+`.jsonl` rollouts; compressed `.jsonl.zst` ancestors require a future
+reader. If a thread was imported before a revert, rerunning the importer will
+**not** append a different rollout revision to the existing Claude transcript:
+use `import --force` to import the newest revision as a separate session.
+
+Codex subagents and internal reviewer/Guardian sessions are excluded by
+default. To inspect or import those explicitly:
+
+```sh
+python3 src/codex_import.py list --include-internal
+python3 src/codex_import.py import --all --include-internal --dry-run
+```
+
+Internal app-control and approval-review prompts that are logged with the
+`user` role are treated as background metadata rather than human messages.
+If a rollout contains no actual conversation, it is skipped.
+
 ## Use
 
 ```sh
