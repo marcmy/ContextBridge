@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import desktop_register
+from context_budget import fit_context
 
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
@@ -808,7 +809,11 @@ def cmd_import(args):
         if not sessions:
             sys.exit(f"No Codex session matching {args.session!r}")
     elif not args.all:
-        sys.exit("Pass --all, or --session <id-prefix>. Use `list` to see them.")
+        sys.exit("Pass --all, or --session <id-prefix>. Use list to see them.")
+    if args.context_budget is not None and args.context_budget < 5000:
+        sys.exit("--context-budget must be at least 5000")
+    if args.replace and (not args.session or len(sessions) != 1 or args.all or args.force):
+        sys.exit("--replace requires exactly one --session, without --all/--force")
 
     # Threads already in Claude — ours, or Claude sessions Codex imported — get any
     # newer Codex turns appended instead of a second copy.
@@ -816,7 +821,11 @@ def cmd_import(args):
     syncs, fresh = [], []
     for s in sessions:
         entry = ledger.get(s["id"])
-        if s["round_trip"] and not args.include_round_trips:
+        if args.replace:
+            if not entry or entry.get("kind") != "import":
+                sys.exit("--replace requires a session previously imported by this tool")
+            fresh.append(s)
+        elif s["round_trip"] and not args.include_round_trips:
             (syncs if not args.no_sync else []).append(s)
             if args.no_sync:
                 print(f"skip {s['id'][:8]}  (round-trip: Codex imported this from "
@@ -870,10 +879,29 @@ def cmd_import(args):
         if not has_conversation(conv.stats):
             print(f"skip {s['id'][:8]}  (no human conversation content)")
             continue
+        budget_info = None
+        if args.context_budget is not None:
+            try:
+                out, budget_info = fit_context(out, args.context_budget,
+                                               max_tool_chars=args.max_tool_chars)
+            except ValueError as err:
+                print(f"skip {s['id'][:8]}  (context budgeting failed: {err})")
+                continue
 
+        old_target = None
+        if args.replace:
+            old_entry = ledger[s["id"]]
+            old_target = Path(old_entry["transcript"])
+            verify_replace_target(old_target, old_entry, args.claude_dir)
+            for rec in out:
+                rec["sessionId"] = old_entry["claudeSessionId"]
+            conv.session_id = old_entry["claudeSessionId"]
         errs = validate(out)
+        if errs:
+            print(f"skip {s['id'][:8]}  (transcript validation failed: {errs[:3]})")
+            continue
         target_dir = Path(args.claude_dir) / slug_for(cwd)
-        target = target_dir / f"{conv.session_id}.jsonl"
+        target = old_target or target_dir / f"{conv.session_id}.jsonl"
 
         base = s["first_user"] or "Codex import"
         title = f"{args.title_prefix}{base}" if args.title_prefix else base
@@ -894,8 +922,18 @@ def cmd_import(args):
         }, ensure_ascii=False))
 
         if not args.dry_run:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target.write_text("\n".join(lines) + "\n")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if old_target is not None:
+                BACKUPS.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+                backup = BACKUPS / f"{target.stem}.{stamp}.jsonl"
+                backup.write_bytes(target.read_bytes())
+                temp = target.with_name(target.name + ".tmp")
+                temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                temp.replace(target)
+                print(f"    original backed up: {backup}")
+            else:
+                target.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         card = None
         if args.desktop:
@@ -906,10 +944,14 @@ def cmd_import(args):
                             "codexRollout": str(s["path"]),
                             "importToolVersion": TOOL_VERSION})
 
-        print(f"{'would write' if args.dry_run else 'wrote'} {target}")
+        action = "replace" if old_target is not None else "write"
+        print(f"{'would ' if args.dry_run else ''}{action} {target}")
         print(f"    from {s['path'].name}")
         print(f"    title: {title}")
         print_stats(conv.stats, errs)
+        if budget_info:
+            print(f"    estimated message context: {budget_info['before']:,} -> {budget_info['after']:,} tokens (budget {args.context_budget:,}, approximate)")
+            print(f"    omitted {budget_info['omitted']} older records; shortened {budget_info['trimmed']} tool/message blocks")
         if args.desktop:
             print(f"    desktop card: {card.name if card else '! registry not found'}")
 
@@ -927,10 +969,37 @@ def cmd_import(args):
                 "sourceBytes": consumed,
                 "kind": "import",
                 "mode": args.mode,
+                "contextBudget": args.context_budget,
                 "toolVersion": TOOL_VERSION,
             }
             save_ledger(ledger)
         print()
+
+
+def verify_replace_target(target: Path, entry: dict, claude_dir: str) -> None:
+    """Never replace a native or continued Claude session by accident."""
+    if not target.is_file():
+        raise SystemExit(f"cannot --replace: imported transcript is missing: {target}")
+    if not target.resolve().is_relative_to(Path(claude_dir).resolve()):
+        raise SystemExit(f"cannot --replace: target is outside Claude projects: {target}")
+    if target.stem != entry.get("claudeSessionId"):
+        raise SystemExit("cannot --replace: existing transcript has unexpected session ID")
+    found_mark = False
+    with target.open(encoding="utf-8") as f:
+        for line in f:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("type") == "custom-title" and record.get("importedFrom") == IMPORT_MARK:
+                found_mark = True
+            if record.get("type") == "assistant":
+                model = (record.get("message") or {}).get("model")
+                if model != IMPORT_MODEL:
+                    raise SystemExit("cannot --replace: Claude has continued this session; "
+                                     "use a fresh import instead to preserve those turns")
+    if not found_mark:
+        raise SystemExit("cannot --replace: missing importer provenance marker")
 
 
 def has_conversation(stats: dict) -> bool:
@@ -958,6 +1027,10 @@ def sync_one(s: dict, entry: dict | None, args, version: str, ledger: dict,
              state: dict) -> None:
     """Append Codex turns newer than what Claude already has for this thread."""
     tid = s["id"]
+    if entry and entry.get("contextBudget"):
+        print(f"skip {tid[:8]}  (context-limited import; use import --replace "
+              "with --session and --context-budget to refresh safely)")
+        return
     # A revert replaces the active rollout and can change/remove earlier turns.
     # Appending new revision bytes to the old Claude session would corrupt history.
     if (entry and entry.get("sourceRollout")
@@ -1371,6 +1444,14 @@ def main():
     imp.add_argument("--force", action="store_true",
                      help="re-import sessions this tool has already imported, as a "
                           "fresh copy, instead of appending their newer Codex turns")
+    imp.add_argument("--context-budget", type=int, metavar="TOKENS",
+                     help="create a lossy working history bounded by a conservative "
+                          "token estimate; keep original Codex rollout untouched")
+    imp.add_argument("--max-tool-chars", type=int, default=3000, metavar="CHARS",
+                     help="max historical tool input/output chars in bounded mode (default: 3000)")
+    imp.add_argument("--replace", action="store_true",
+                     help="safely replace one previous import in place after backup; "
+                          "requires --session, refuses new Claude work")
     imp.add_argument("--no-sync", action="store_true",
                      help="skip threads already in Claude instead of appending the "
                           "Codex turns they gained since")
