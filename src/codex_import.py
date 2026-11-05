@@ -21,6 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import desktop_register
+from context_budget import fit_context
 
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
@@ -807,6 +808,10 @@ def cmd_import(args):
         sessions = [s for s in sessions if s["id"] and s["id"].startswith(args.session)]
         if not sessions:
             sys.exit(f"No Codex session matching {args.session!r}")
+    if args.context_budget is not None and args.context_budget < 5000:
+        sys.exit("--context-budget must be at least 5000")
+    if args.replace and (not args.session or len(sessions) != 1 or args.all or args.force):
+        sys.exit("--replace requires exactly one --session, without --all/--force")
     elif not args.all:
         sys.exit("Pass --all, or --session <id-prefix>. Use `list` to see them.")
 
@@ -816,7 +821,11 @@ def cmd_import(args):
     syncs, fresh = [], []
     for s in sessions:
         entry = ledger.get(s["id"])
-        if s["round_trip"] and not args.include_round_trips:
+        if args.replace:
+            if not entry or entry.get("kind") != "import":
+                sys.exit("--replace requires a session previously imported by this tool")
+            fresh.append(s)
+        elif s["round_trip"] and not args.include_round_trips:
             (syncs if not args.no_sync else []).append(s)
             if args.no_sync:
                 print(f"skip {s['id'][:8]}  (round-trip: Codex imported this from "
@@ -870,10 +879,29 @@ def cmd_import(args):
         if not has_conversation(conv.stats):
             print(f"skip {s['id'][:8]}  (no human conversation content)")
             continue
+        budget_info = None
+        if args.context_budget is not None:
+            try:
+                out, budget_info = fit_context(out, args.context_budget,
+                                               max_tool_chars=args.max_tool_chars)
+            except ValueError as err:
+                print(f"skip {s['id'][:8]}  (context budgeting failed: {err})")
+                continue
 
+        old_target = None
+        if args.replace:
+            old_entry = ledger[s["id"]]
+            old_target = Path(old_entry["transcript"])
+            verify_replace_target(old_target, old_entry, args.claude_dir)
+            for rec in out:
+                rec["sessionId"] = old_entry["claudeSessionId"]
+            conv.session_id = old_entry["claudeSessionId"]
         errs = validate(out)
+        if errs:
+            print(f"skip {s['id'][:8]}  (transcript validation failed: {errs[:3]})")
+            continue
         target_dir = Path(args.claude_dir) / slug_for(cwd)
-        target = target_dir / f"{conv.session_id}.jsonl"
+        target = old_target or target_dir / f"{conv.session_id}.jsonl"
 
         base = s["first_user"] or "Codex import"
         title = f"{args.title_prefix}{base}" if args.title_prefix else base
@@ -894,8 +922,18 @@ def cmd_import(args):
         }, ensure_ascii=False))
 
         if not args.dry_run:
-            target_dir.mkdir(parents=True, exist_ok=True)
-            target.write_text("\n".join(lines) + "\n")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if old_target is not None:
+                BACKUPS.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+                backup = BACKUPS / f"{target.stem}.{stamp}.jsonl"
+                backup.write_bytes(target.read_bytes())
+                temp = target.with_name(target.name + ".tmp")
+                temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                temp.replace(target)
+                print(f"    original backed up: {backup}")
+            else:
+                target.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         card = None
         if args.desktop:
@@ -906,10 +944,14 @@ def cmd_import(args):
                             "codexRollout": str(s["path"]),
                             "importToolVersion": TOOL_VERSION})
 
-        print(f"{'would write' if args.dry_run else 'wrote'} {target}")
+        action = "replace" if old_target is not None else "write"
+        print(f"{'would ' if args.dry_run else ''}{action} {target}")
         print(f"    from {s['path'].name}")
         print(f"    title: {title}")
         print_stats(conv.stats, errs)
+        if budget_info:
+            print(f"    estimated message context: {budget_info['before']:,} -> {budget_info['after']:,} tokens (budget {args.context_budget:,}, approximate)")
+            print(f"    omitted {budget_info['omitted']} older records; shortened {budget_info['trimmed']} tool/message blocks")
         if args.desktop:
             print(f"    desktop card: {card.name if card else '! registry not found'}")
 
@@ -927,6 +969,7 @@ def cmd_import(args):
                 "sourceBytes": consumed,
                 "kind": "import",
                 "mode": args.mode,
+                "contextBudget": args.context_budget,
                 "toolVersion": TOOL_VERSION,
             }
             save_ledger(ledger)
