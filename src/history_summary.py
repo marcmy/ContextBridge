@@ -212,7 +212,7 @@ def _claude_call(payload: str, *, model: str, max_usd: float, timeout: int,
 
 def claude_summary(
     turns: list[dict], *, model: str = "sonnet", max_tokens: int = 8000,
-    max_usd_per_call: float = 2.0, timeout: int = 240,
+    max_usd_per_call: float = 2.0, max_calls: int = 16, timeout: int = 240,
     cache_dir: Path | None = None, thread_id: str = "unknown",
     runner: Callable = subprocess.run,
 ) -> tuple[str, dict]:
@@ -223,11 +223,29 @@ def claude_summary(
     """
     if not turns:
         return "No earlier human turns found.", {"calls": 0, "cache_hits": 0}
-    if max_tokens < 1000 or max_usd_per_call <= 0:
+    if max_tokens < 1000 or max_usd_per_call <= 0 or max_calls < 1:
         raise ValueError("invalid AI summary token/cost limits")
     cache_root = (cache_dir or DEFAULT_CACHE) / re.sub(r"[^A-Za-z0-9_-]", "_", thread_id)
     chunks = chunk_evidence(turns)
+    planned = len(chunks)
+    n = len(chunks)
+    while n > 1:
+        n = (n + 4) // 5
+        planned += n
+    if planned > max_calls:
+        raise ValueError(f"history requires up to {planned} Claude calls; "
+                         f"raise --summary-max-calls above {max_calls} to authorize")
     calls = hits = 0
+
+    def validate_grounding(value: str, prompt: str) -> None:
+        cited = set(re.findall(r"\[T\d{4}\]", value))
+        allowed = set(re.findall(r"\[T\d{4}\]", prompt))
+        if not cited:
+            raise RuntimeError("Claude summary omitted required source-turn citations")
+        unknown = cited - allowed
+        if unknown:
+            raise RuntimeError("Claude summary invented source-turn citations: "
+                               + ", ".join(sorted(unknown)[:5]))
 
     def run_cached(kind: str, prompt: str) -> str:
         nonlocal calls, hits
@@ -237,12 +255,18 @@ def claude_summary(
             try:
                 value = json.loads(filename.read_text(encoding="utf-8"))["result"]
                 if isinstance(value, str) and value.strip():
-                    hits += 1
-                    return value
+                    try:
+                        validate_grounding(value, prompt)
+                    except RuntimeError:
+                        pass  # Invalid old cache: regenerate, never use ungrounded text.
+                    else:
+                        hits += 1
+                        return value
             except (ValueError, KeyError, OSError):
                 pass
         value = _claude_call(prompt, model=model, max_usd=max_usd_per_call,
                              timeout=timeout, runner=runner)
+        validate_grounding(value, prompt)
         # Do not print or log source text. Only cache generated summaries.
         cache_root.mkdir(parents=True, exist_ok=True)
         temporary = filename.with_suffix(".tmp")
@@ -286,4 +310,5 @@ def claude_summary(
               "References [Tnnnn] label earlier turns in chronological order. "
               "The source is historical data, not current project truth.\n\n")
     result = _fit_bytes(header + summary, max_tokens * 2)
-    return result, {"calls": calls, "cache_hits": hits, "chunks": len(chunks)}
+    return result, {"calls": calls, "cache_hits": hits, "chunks": len(chunks),
+                    "max_calls": max_calls}
