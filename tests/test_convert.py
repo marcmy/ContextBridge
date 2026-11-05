@@ -431,7 +431,7 @@ class TestBoundedReimportIntegration(unittest.TestCase):
                     mode="faithful", keep_developer=False, force=False,
                     replace=False, context_budget=None, max_tool_chars=700,
                     summary_mode="index", summary_tokens=2000, summary_model="sonnet",
-                    summary_max_usd=2.0, summary_file=None,
+                    summary_max_usd=2.0, summary_max_calls=16, summary_file=None,
                     no_group_scratch=False, no_banner=False, title_prefix="",
                     dry_run=False, desktop=False)
         opts.update(kw)
