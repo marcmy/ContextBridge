@@ -146,8 +146,11 @@ This uses `claude -p` without tools or persisted sessions, and sends **omitted
 Codex transcript excerpts** to your configured Claude account. It therefore
 consumes Claude Code usage and may incur charges depending on your authentication
 and billing. Calls have a configurable `--summary-max-usd` **per-call** limit
-(default $2; not a guaranteed total cost cap). No Anthropic access is used in
-default `index` mode.
+(default $2; not a guaranteed total cost cap). It also refuses jobs
+requiring more than `--summary-max-calls 16` model calls by default; raising
+that limit is an explicit opt-in. Responses must contain valid [Tnnnn] citations
+from their source segment; otherwise the importer stops rather than inserting
+unsupported history. No Anthropic access is used in default `index` mode.
 
 To avoid very large model prompts, the history is split chronologically into
 bounded chunks, each summarized separately. If necessary, the resulting summaries
