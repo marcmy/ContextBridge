@@ -383,6 +383,88 @@ class TestContextBudget(unittest.TestCase):
                              if isinstance(b, dict)))
 
 
+class TestBoundedReimportIntegration(unittest.TestCase):
+    """End-to-end: preview writes nothing, in-place replace backs up exactly one import."""
+
+    def setUp(self):
+        import tempfile
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.codex_dir = self.root / "codex"
+        self.codex_dir.mkdir()
+        self.claude_dir = self.root / "claude" / "projects"
+        self.claude_dir.mkdir(parents=True)
+        self.orig_ledger, self.orig_backups = ci.LEDGER, ci.BACKUPS
+        ci.LEDGER = self.root / "claude" / "codex-imports.json"
+        ci.BACKUPS = self.root / "claude" / "codex-import-backups"
+        self.addCleanup(self.restore)
+        self.tid = "01a1ab29-4f15-7150-ac01-306e71950872"
+        path = self.codex_dir / f"rollout-2026-11-05T05-04-03-{self.tid}.jsonl"
+        rows = [
+            {"type": "session_meta", "payload": {
+                "id": self.tid, "timestamp": "2026-11-05T05:04:03Z",
+                "cwd": str(self.root), "source": "cli", "originator": "Codex Desktop"
+            }},
+        ]
+        for idx in range(12):
+            rows += [
+                ri({"type": "message", "role": "user", "content": [{
+                    "type": "input_text", "text": f"Implement change number {idx}"}]}),
+                ri({"type": "custom_tool_call", "name": "exec",
+                    "call_id": f"call{idx}", "input": "echo test"}),
+                ri({"type": "custom_tool_call_output", "call_id": f"call{idx}",
+                    "output": [{"type": "input_text", "text": "data" * 2000}]}),
+                ri({"type": "message", "role": "assistant", "content": [{
+                    "type": "output_text", "text": f"Change number {idx} complete"}]}),
+            ]
+        path.write_bytes(jsonl(rows))
+
+    def restore(self):
+        ci.LEDGER, ci.BACKUPS = self.orig_ledger, self.orig_backups
+
+    def options(self, **kw):
+        from argparse import Namespace
+        opts = dict(codex_dir=str(self.codex_dir), claude_dir=str(self.claude_dir),
+                    session=self.tid[:8], all=False, include_internal=False,
+                    include_round_trips=False, no_sync=False,
+                    mode="faithful", keep_developer=False, force=False,
+                    replace=False, context_budget=None, max_tool_chars=700,
+                    no_group_scratch=False, no_banner=False, title_prefix="",
+                    dry_run=False, desktop=False)
+        opts.update(kw)
+        return Namespace(**opts)
+
+    def test_replace_has_dry_run_and_backup(self):
+        import contextlib, io
+        def run(**kw):
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                ci.cmd_import(self.options(**kw))
+            return log.getvalue()
+
+        run()
+        original_entry = ci.load_ledger()[self.tid]
+        target = Path(original_entry["transcript"])
+        original = target.read_bytes()
+        self.assertGreater(len(original), 100000)
+        dry_output = run(replace=True, context_budget=12000, dry_run=True)
+        self.assertIn("would replace", dry_output)
+        self.assertEqual(target.read_bytes(), original)
+        self.assertFalse(ci.BACKUPS.exists())
+        run(replace=True, context_budget=12000)
+        entry = ci.load_ledger()[self.tid]
+        self.assertEqual(entry["transcript"], str(target))
+        self.assertEqual(entry["claudeSessionId"], original_entry["claudeSessionId"])
+        self.assertEqual(entry["contextBudget"], 12000)
+        self.assertLess(target.stat().st_size, len(original))
+        self.assertEqual(list(ci.BACKUPS.glob("*.jsonl"))[0].read_bytes(), original)
+
+        imported = [json.loads(line) for line in target.read_text().splitlines()]
+        chain = [r for r in imported if r.get("type") in ("user", "assistant")]
+        self.assertEqual(ci.validate(chain), [])
+        self.assertEqual(len({r["sessionId"] for r in chain}), 1)
+
+
 class TestSafeReplace(unittest.TestCase):
     def setUp(self):
         import tempfile
