@@ -106,7 +106,9 @@ def _omitted_note(prefix: list[dict], clipped: int) -> str:
     return report
 
 
-def fit_context(records: list[dict], budget: int, max_tool_chars: int = 3000) -> tuple[list[dict], dict]:
+def fit_context(records: list[dict], budget: int, max_tool_chars: int = 3000, *,
+                historical_summary: str | None = None,
+                summary_reserve_tokens: int = 0) -> tuple[list[dict], dict]:
     """Keep the most recent complete user-turn groups under a rough token budget.
 
     Each group starts at a real user message. Paired tool use/results remain in
@@ -115,6 +117,10 @@ def fit_context(records: list[dict], budget: int, max_tool_chars: int = 3000) ->
     """
     if budget < 5000:
         raise ValueError("context budget must be at least 5000 tokens")
+    if summary_reserve_tokens < 0 or summary_reserve_tokens >= budget - 2000:
+        raise ValueError("summary reserve must leave at least 2000 tokens for history")
+    if max_tool_chars < 100:
+        raise ValueError("max_tool_chars must be at least 100")
     if not records:
         return [], {"before": 0, "after": 0, "omitted": 0, "trimmed": 0}
 
@@ -143,7 +149,8 @@ def fit_context(records: list[dict], budget: int, max_tool_chars: int = 3000) ->
         raise ValueError("no human message found to construct a working context")
 
     # Reserve a few thousand estimated tokens for the provenance/omission note.
-    reserve = min(6000, max(1500, budget // 12))
+    reserve = max(min(6000, max(1500, budget // 12)),
+                  summary_reserve_tokens + 2000 if summary_reserve_tokens else 0)
     limit = budget - reserve
     selected = []
     cost = 0
@@ -181,7 +188,10 @@ def fit_context(records: list[dict], budget: int, max_tool_chars: int = 3000) ->
     kept_ids = {id(r) for group in selected for r in group}
     omitted = [r for group in groups for r in group if id(r) not in kept_ids]
     omitted = prelude + omitted
-    note = _note(selected[0][0], _omitted_note(omitted, clipped))
+    body = _omitted_note(omitted, clipped)
+    if historical_summary:
+        body += "\n\n" + historical_summary
+    note = _note(selected[0][0], body)
     result = ([banner] if banner is not None else []) + [note] + [
         r for group in selected for r in group
     ]
@@ -192,4 +202,5 @@ def fit_context(records: list[dict], budget: int, max_tool_chars: int = 3000) ->
     if after > budget:
         raise ValueError(f"estimated working history {after} exceeds budget {budget}")
     return result, {"before": original_size, "after": after,
-                    "omitted": len(omitted), "trimmed": clipped}
+                    "omitted": len(omitted), "retained": sum(len(g) for g in selected),
+                    "trimmed": clipped, "summary_estimate": estimate_tokens([note])}
