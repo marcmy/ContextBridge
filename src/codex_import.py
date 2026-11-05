@@ -976,6 +976,32 @@ def cmd_import(args):
         print()
 
 
+def verify_replace_target(target: Path, entry: dict, claude_dir: str) -> None:
+    """Never replace a native or continued Claude session by accident."""
+    if not target.is_file():
+        raise SystemExit(f"cannot --replace: imported transcript is missing: {target}")
+    if not target.resolve().is_relative_to(Path(claude_dir).resolve()):
+        raise SystemExit(f"cannot --replace: target is outside Claude projects: {target}")
+    if target.stem != entry.get("claudeSessionId"):
+        raise SystemExit("cannot --replace: existing transcript has unexpected session ID")
+    found_mark = False
+    with target.open(encoding="utf-8") as f:
+        for line in f:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if record.get("type") == "custom-title" and record.get("importedFrom") == IMPORT_MARK:
+                found_mark = True
+            if record.get("type") == "assistant":
+                model = (record.get("message") or {}).get("model")
+                if model != IMPORT_MODEL:
+                    raise SystemExit("cannot --replace: Claude has continued this session; "
+                                     "use a fresh import instead to preserve those turns")
+    if not found_mark:
+        raise SystemExit("cannot --replace: missing importer provenance marker")
+
+
 def has_conversation(stats: dict) -> bool:
     """Do not import an internal-only background transcript."""
     return any(stats[k] for k in ("user", "assistant", "tool_use", "tool_result"))
@@ -1001,6 +1027,10 @@ def sync_one(s: dict, entry: dict | None, args, version: str, ledger: dict,
              state: dict) -> None:
     """Append Codex turns newer than what Claude already has for this thread."""
     tid = s["id"]
+    if entry and entry.get("contextBudget"):
+        print(f"skip {tid[:8]}  (context-limited import; use import --replace "
+              "with --session and --context-budget to refresh safely)")
+        return
     # A revert replaces the active rollout and can change/remove earlier turns.
     # Appending new revision bytes to the old Claude session would corrupt history.
     if (entry and entry.get("sourceRollout")
@@ -1414,6 +1444,14 @@ def main():
     imp.add_argument("--force", action="store_true",
                      help="re-import sessions this tool has already imported, as a "
                           "fresh copy, instead of appending their newer Codex turns")
+    imp.add_argument("--context-budget", type=int, metavar="TOKENS",
+                     help="create a lossy working history bounded by a conservative "
+                          "token estimate; keep original Codex rollout untouched")
+    imp.add_argument("--max-tool-chars", type=int, default=3000, metavar="CHARS",
+                     help="max historical tool input/output chars in bounded mode (default: 3000)")
+    imp.add_argument("--replace", action="store_true",
+                     help="safely replace one previous import in place after backup; "
+                          "requires --session, refuses new Claude work")
     imp.add_argument("--no-sync", action="store_true",
                      help="skip threads already in Claude instead of appending the "
                           "Codex turns they gained since")
