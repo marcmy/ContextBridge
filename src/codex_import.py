@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import desktop_register
 from context_budget import fit_context
+from history_summary import evidence_turns, offline_digest, claude_summary
 
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
@@ -812,6 +813,17 @@ def cmd_import(args):
         sys.exit("Pass --all, or --session <id-prefix>. Use list to see them.")
     if args.context_budget is not None and args.context_budget < 5000:
         sys.exit("--context-budget must be at least 5000")
+    if args.summary_tokens < 1000 or args.summary_tokens > 30000:
+        sys.exit("--summary-tokens must be between 1000 and 30000")
+    if args.summary_max_usd <= 0:
+        sys.exit("--summary-max-usd must be positive")
+    if args.summary_file and args.context_budget is None:
+        sys.exit("--summary-file requires --context-budget")
+    if args.summary_mode == "claude" and args.context_budget is None:
+        sys.exit("--summary-mode claude requires --context-budget")
+    if (args.context_budget is not None and args.summary_mode != "off"
+            and args.context_budget <= args.summary_tokens + 4000):
+        sys.exit("context budget must leave 4000 tokens beyond summary reserve")
     if args.replace and (not args.session or len(sessions) != 1 or args.all or args.force):
         sys.exit("--replace requires exactly one --session, without --all/--force")
 
@@ -880,12 +892,43 @@ def cmd_import(args):
             print(f"skip {s['id'][:8]}  (no human conversation content)")
             continue
         budget_info = None
+        summary_info = None
         if args.context_budget is not None:
             try:
-                out, budget_info = fit_context(out, args.context_budget,
-                                               max_tool_chars=args.max_tool_chars)
-            except ValueError as err:
-                print(f"skip {s['id'][:8]}  (context budgeting failed: {err})")
+                original_out = out
+                with_summary = (args.summary_mode != "off" or bool(args.summary_file))
+                reserve = args.summary_tokens if with_summary else 0
+                preview, _ = fit_context(original_out, args.context_budget,
+                                         max_tool_chars=args.max_tool_chars,
+                                         summary_reserve_tokens=reserve)
+                keep_uuids = {r["uuid"] for r in preview if r.get("uuid")}
+                earlier = [r for r in original_out if r.get("uuid") not in keep_uuids]
+                turns = evidence_turns(earlier)
+                summary = None
+                summary_info = {"mode": "off", "turns": len(turns)}
+                if earlier and with_summary:
+                    if args.summary_file:
+                        summary = Path(args.summary_file).read_text(encoding="utf-8")
+                        summary_info["mode"] = "file"
+                    elif args.summary_mode == "claude" and not args.dry_run:
+                        summary, ai_stats = claude_summary(
+                            turns, model=args.summary_model,
+                            max_tokens=args.summary_tokens,
+                            max_usd_per_call=args.summary_max_usd,
+                            thread_id=s["id"])
+                        summary_info.update(mode="claude", **ai_stats)
+                    else:
+                        summary = offline_digest(turns, max_tokens=args.summary_tokens)
+                        summary_info["mode"] = "index"
+                        if args.summary_mode == "claude":
+                            summary_info["dry_run_skipped_claude"] = True
+                    if not summary or not summary.strip():
+                        raise ValueError("history summary was empty")
+                out, budget_info = fit_context(
+                    original_out, args.context_budget, max_tool_chars=args.max_tool_chars,
+                    historical_summary=summary, summary_reserve_tokens=reserve)
+            except (ValueError, RuntimeError, OSError) as err:
+                print(f"skip {s['id'][:8]}  (context summary failed: {err})")
                 continue
 
         old_target = None
@@ -951,7 +994,19 @@ def cmd_import(args):
         print_stats(conv.stats, errs)
         if budget_info:
             print(f"    estimated message context: {budget_info['before']:,} -> {budget_info['after']:,} tokens (budget {args.context_budget:,}, approximate)")
-            print(f"    omitted {budget_info['omitted']} older records; shortened {budget_info['trimmed']} tool/message blocks")
+            print(f"    retained {budget_info['retained']} historical records; "
+                  f"omitted {budget_info['omitted']}; shortened "
+                  f"{budget_info['trimmed']} large blocks")
+            if summary_info:
+                print(f"    historical summary: {summary_info['mode']} "
+                      f"({summary_info['turns']} earlier human turns; "
+                      f"~{budget_info['summary_estimate']:,} estimated note tokens)")
+                if summary_info.get("dry_run_skipped_claude"):
+                    print("    dry-run: Claude AI calls skipped; final summary "
+                          "size and retained turn count may vary")
+                if summary_info.get("calls") is not None:
+                    print(f"    Claude summary calls: {summary_info['calls']}; "
+                          f"cache hits: {summary_info['cache_hits']}")
         if args.desktop:
             print(f"    desktop card: {card.name if card else '! registry not found'}")
 
@@ -970,6 +1025,8 @@ def cmd_import(args):
                 "kind": "import",
                 "mode": args.mode,
                 "contextBudget": args.context_budget,
+                "summaryMode": summary_info["mode"] if summary_info else "off",
+                "summaryTokens": args.summary_tokens if summary_info else None,
                 "toolVersion": TOOL_VERSION,
             }
             save_ledger(ledger)
@@ -1449,6 +1506,17 @@ def main():
                           "token estimate; keep original Codex rollout untouched")
     imp.add_argument("--max-tool-chars", type=int, default=3000, metavar="CHARS",
                      help="max historical tool input/output chars in bounded mode (default: 3000)")
+    imp.add_argument("--summary-mode", choices=("off", "index", "claude"), default="index",
+                     help="off: old excerpt note; index: grounded offline digest (default); "
+                          "claude: opt-in AI summary using Claude Code CLI, consumes usage")
+    imp.add_argument("--summary-tokens", type=int, default=8000, metavar="TOKENS",
+                     help="estimated tokens reserved for historical summary (default: 8000)")
+    imp.add_argument("--summary-model", default="sonnet", metavar="MODEL",
+                     help="Claude Code model alias for opt-in AI summarization (default: sonnet)")
+    imp.add_argument("--summary-max-usd", type=float, default=2.0, metavar="USD",
+                     help="Claude Code max-budget cap PER summary call (default: $2)")
+    imp.add_argument("--summary-file", metavar="PATH",
+                     help="use a pre-written or reviewed history summary as a local text file")
     imp.add_argument("--replace", action="store_true",
                      help="safely replace one previous import in place after backup; "
                           "requires --session, refuses new Claude work")
