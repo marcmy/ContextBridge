@@ -777,7 +777,8 @@ class HandoffEngine:
             "kind": "import" if not native else "round-trip", "mode": self._append_mode(plan)})
         entry.update({"transcript": str(target), "syncedAt": now, "sourceRollout": str(active),
                       "sourceSha256": digest, "sourceBytes": consumed,
-                      "sourceMtime": int(Path(active).stat().st_mtime), "toolVersion": ci.TOOL_VERSION})
+                      "sourceMtime": int(Path(active).stat().st_mtime),
+                      "transcriptBytes": target.stat().st_size, "toolVersion": ci.TOOL_VERSION})
         # Only when appending to the session that ledger entry names; else keep it.
         if entry.get("claudeSessionId") == res["sessionId"]:
             ci.save_ledger(ledger)

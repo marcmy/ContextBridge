@@ -848,6 +848,94 @@ def validate(recs: list[dict], root: str | None = None) -> list[str]:
 CHAIN_TYPES = {"user", "assistant", "system", "attachment"}
 
 
+SYNTHETIC_MODELS = {IMPORT_MODEL, "<synthetic>"}
+NOT_HUMAN_PREFIXES = ("[Request interrupted", "<task-notification", "Caveat: ")
+# Live Claude Code records carry at least one of these; the converter's envelope has none.
+LIVE_RECORD_FIELDS = {"promptId", "origin", "promptSource", "permissionMode"}
+
+
+def is_converter_record(rec: dict) -> bool:
+    return rec.get("entrypoint") == "cli" and not (LIVE_RECORD_FIELDS & rec.keys())
+
+
+def human_text(rec: dict) -> str | None:
+    """The text a person typed in a Claude `user` record, or None for anything else."""
+    if rec.get("type") != "user" or rec.get("isMeta") or rec.get("isSidechain"):
+        return None
+    origin = rec.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        return None
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return None
+        content = "\n".join(b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(content, str) or not content.strip():
+        return None
+    if content.lstrip().startswith(NOT_HUMAN_PREFIXES):
+        return None
+    return split_user_message(content)[1] or None
+
+
+def native_turns_after(path: Path, offset: int = 0, since_ms: int | None = None) -> int:
+    """Claude's own turns in a transcript past a byte offset, optionally only those
+    newer than a time. Turns this tool converted and appended don't count."""
+    count = 0
+    with Path(path).open("rb") as fh:
+        fh.seek(offset)
+        for raw in fh:
+            if not raw.endswith(b"\n") or b'"api-request' in raw[:400]:
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if rec.get("isSidechain") or rec.get("type") not in ("user", "assistant"):
+                continue
+            if since_ms is not None and (ms_of(rec.get("timestamp") or "") or 0) <= since_ms:
+                continue
+            if rec["type"] == "assistant":
+                count += (rec.get("message") or {}).get("model") not in SYNTHETIC_MODELS
+            elif human_text(rec) and not is_converter_record(rec):
+                count += 1
+    return count
+
+
+def claude_side_checkpoint(target: Path, entry: dict | None, thread_id: str
+                           ) -> tuple[int | None, int | None]:
+    """(byte offset, time in ms) past which Claude work is new to the Codex thread.
+
+    Newest evidence first: the size recorded after our last write, our last provenance
+    record in the transcript, then what Codex's own ledger says it imported. Both None
+    means the boundary can't be established.
+    """
+    if entry and entry.get("transcriptBytes") is not None:
+        recorded = entry["transcriptBytes"]
+        return (recorded, None) if recorded <= target.stat().st_size else (None, None)
+    if entry:
+        mark = None
+        with target.open("rb") as fh:
+            position = 0
+            for raw in fh:
+                position += len(raw)
+                if b'"custom-title"' in raw and IMPORT_MARK.encode() in raw:
+                    mark = position
+        if mark is not None:
+            return mark, None
+        when = ms_of(entry.get("syncedAt") or entry.get("importedAt") or "")
+        return None, when
+    try:
+        records = json.loads(CODEX_IMPORT_LEDGER.read_text(encoding="utf-8")).get("records", [])
+    except (OSError, ValueError):
+        return None, None
+    digest = next((r.get("content_sha256") for r in records
+                   if r.get("imported_thread_id") == thread_id), None)
+    if not digest:
+        return None, None
+    return prefix_offset(target.read_bytes(), digest), None
+
+
 def transcript_tail(path: Path) -> dict:
     """Where an existing Claude transcript's conversation ends, and what it is called."""
     info = {"leaf": None, "cwd": None, "sessionId": None, "title": None, "lastTs": ""}
@@ -1038,10 +1126,12 @@ def cmd_import(args):
         sync_one(s, ledger.get(s["id"]), args, version, ledger, state)
     if state["current"]:
         print(f"  -- {state['current']} already in Claude and up to date\n")
+    if state.get("diverged"):
+        print(f"  -- {state['diverged']} skipped because Claude has its own newer work\n")
     sessions = fresh
 
     if not sessions:
-        if not state["appended"]:
+        if not state["appended"] and not state.get("diverged"):
             print("Nothing to do.")
         return
 
@@ -1237,6 +1327,7 @@ def ledger_entry(s: dict, built: dict, target: Path, card, args) -> dict:
         "sourceSha256": built["digest"],
         "sourceMtime": int(s["path"].stat().st_mtime),
         "sourceBytes": built["consumed"],
+        "transcriptBytes": target.stat().st_size,
         "kind": "import",
         "mode": args.mode,
         "contextBudget": args.context_budget,
@@ -1291,6 +1382,10 @@ def print_stats(st: dict, errs: list[str]) -> None:
         print("    VALIDATION:")
         for e in errs[:10]:
             print(f"      ! {e}")
+
+
+CONTINUATION_HINT = ("`contextbridge send {tid} --strategy continuation --yes` keeps them "
+                     "separate, and --allow-divergent appends anyway")
 
 
 def sync_one(s: dict, entry: dict | None, args, version: str, ledger: dict,
@@ -1352,6 +1447,22 @@ def sync_one(s: dict, entry: dict | None, args, version: str, ledger: dict,
             return
         target = hits[0]
 
+    if not getattr(args, "allow_divergent", False):
+        offset, since = claude_side_checkpoint(target, entry, tid)
+        if offset is None and since is None:
+            print(f"skip {tid[:8]}  (can't establish what Claude session {target.stem[:8]} had "
+                  "at the last transfer, so appending could merge diverged work. Nothing was "
+                  "changed; " + CONTINUATION_HINT.format(tid=tid[:13]) + ")")
+            state["diverged"] = state.get("diverged", 0) + 1
+            return
+        moved = native_turns_after(target, offset or 0, since)
+        if moved:
+            print(f"skip {tid[:8]}  (both agents moved on: Claude session {target.stem[:8]} has "
+                  f"{moved} native turn(s) since the last transfer. Nothing was changed; "
+                  + CONTINUATION_HINT.format(tid=tid[:13]) + ")")
+            state["diverged"] = state.get("diverged", 0) + 1
+            return
+
     mode = entry.get("mode", args.mode) if entry else args.mode
     res = append_codex_turns(s, data, start, target, mode=mode,
                              keep_developer=args.keep_developer, version=version,
@@ -1385,7 +1496,8 @@ def sync_one(s: dict, entry: dict | None, args, version: str, ledger: dict,
     print_stats(res["stats"], res["errs"])
     if tail["lastTs"] > res["first"]:
         print(f"    note: this session also moved on in Claude (last turn "
-              f"{tail['lastTs'][:16].replace('T', ' ')}); the Codex turns follow it")
+              f"{tail['lastTs'][:16].replace('T', ' ')}); the Codex turns follow it "
+              "because --allow-divergent was given")
     if args.dry_run:
         print()
         return
@@ -1402,6 +1514,7 @@ def sync_one(s: dict, entry: dict | None, args, version: str, ledger: dict,
     entry.update({"transcript": str(target), "syncedAt": now,
                   "sourceSha256": res["digest"], "sourceBytes": res["end"],
                   "sourceMtime": int(s["path"].stat().st_mtime),
+                  "transcriptBytes": target.stat().st_size,
                   "toolVersion": TOOL_VERSION})
     save_ledger(ledger)
     print()
@@ -1743,6 +1856,9 @@ def main():
     imp.add_argument("--no-sync", action="store_true",
                      help="skip threads already in Claude instead of appending the "
                           "Codex turns they gained since")
+    imp.add_argument("--allow-divergent", action="store_true",
+                     help="append new Codex turns even when the Claude session has its own "
+                          "newer work (default: skip it, so histories never merge silently)")
     imp.add_argument("--desktop", action="store_true",
                      help="also register each session with the Claude desktop app so "
                           "it appears in the sidebar (relaunch the app afterwards)")
