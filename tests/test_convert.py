@@ -498,7 +498,7 @@ class TestBoundedReimportIntegration(unittest.TestCase):
             # must abort BEFORE issuing any additional billable model call.
             with target.open("a") as file:
                 file.write(json.dumps({"type": "assistant",
-                                       "message": {"model": "claude-opus-4-8"}}) + "\\n")
+                                       "message": {"model": "claude-opus-4-8"}}) + "\n")
             before = target.read_bytes()
             with self.assertRaisesRegex(SystemExit, "Claude has continued"):
                 run(replace=True, context_budget=12000, summary_mode="claude")
