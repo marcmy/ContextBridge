@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contextbridge"
+version = "0.1.0"
+description = "One workflow. Any AI agent. Move development conversations between OpenAI Codex and Claude Code."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+dependencies = ["zstandard>=0.22; python_version < '3.14'"]
+
+[project.optional-dependencies]
+gui = ["PySide6-Essentials>=6.10"]
+
+[project.scripts]
+contextbridge = "contextbridge.__main__:main"
+codex-import = "codex_import:main"
+
+[project.gui-scripts]
+contextbridge-gui = "contextbridge.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["codex_import", "context_budget", "desktop_register", "history_summary"]
+packages = ["contextbridge", "contextbridge.ui"]
+
+[tool.setuptools.package-data]
+"contextbridge.ui" = ["assets/*.svg"]

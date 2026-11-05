@@ -6,7 +6,10 @@ Writing `~/.claude/projects/<slug>/<uuid>.jsonl` is enough for the CLI: `claude 
 scans that directory directly. The desktop app does not. It lists sessions from its
 own registry:
 
-    ~/Library/Application Support/Claude/claude-code-sessions/<account>/<workspace>/local_<uuid>.json
+    <support>/claude-code-sessions/<account>/<workspace>/local_<uuid>.json
+
+where <support> is ~/Library/Application Support/Claude on macOS and, for the Windows
+Store build, %LOCALAPPDATA%\\Claude-Data\\anthropicpbc.claude_<publisher>.
 
 Each of those is a session card — title, cwd, model, timestamps — joined to the
 transcript on disk by its `cliSessionId` field. No registry entry, no row in the
@@ -20,11 +23,28 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
 
-SUPPORT = Path.home() / "Library" / "Application Support" / "Claude"
+
+
+def support_dir(home: Path | None = None) -> Path:
+    """The desktop app's data directory for this platform (the macOS path when none
+    exists, so callers report 'registry not found' rather than crash)."""
+    home = home or Path.home()
+    mac = home / "Library" / "Application Support" / "Claude"
+    if sys.platform != "win32":
+        return mac
+    data = Path(os.environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
+    candidates = [*sorted((data / "Claude-Data").glob("anthropicpbc.claude_*")),
+                  Path(os.environ.get("APPDATA") or home / "AppData" / "Roaming") / "Claude"]
+    return next((c for c in candidates if (c / "claude-code-sessions").is_dir()), mac)
+
+
+SUPPORT = support_dir()
 SESSIONS = SUPPORT / "claude-code-sessions"
 CONFIG = SUPPORT / "config.json"
 
@@ -39,7 +59,7 @@ DROP = {"error", "errorAt", "priorErrorMark", "worktreePath", "worktreeName",
 
 def active_account() -> str | None:
     try:
-        return json.loads(CONFIG.read_text()).get("lastKnownAccountUuid")
+        return json.loads(CONFIG.read_text(encoding="utf-8")).get("lastKnownAccountUuid")
     except Exception:
         return None
 
@@ -68,7 +88,7 @@ def template_entry(reg: Path) -> dict | None:
     entries = sorted(reg.glob("local_*.json"), key=lambda p: p.stat().st_mtime)
     if not entries:
         return None
-    return json.loads(entries[-1].read_text())
+    return json.loads(entries[-1].read_text(encoding="utf-8"))
 
 
 def register(cli_session_id: str, cwd: str, title: str, created_ms: int | None = None,
@@ -110,7 +130,7 @@ def register(cli_session_id: str, cwd: str, title: str, created_ms: int | None =
 
     target = reg / f"{local_id}.json"
     if not dry_run:
-        target.write_text(json.dumps(entry, indent=2))
+        target.write_text(json.dumps(entry, indent=2), encoding="utf-8")
     return target
 
 
@@ -138,7 +158,7 @@ def cards_by_cli_id(reg: Path) -> dict[str, Path]:
     out = {}
     for f in reg.glob("local_*.json"):
         try:
-            out[json.loads(f.read_text()).get("cliSessionId")] = f
+            out[json.loads(f.read_text(encoding="utf-8")).get("cliSessionId")] = f
         except Exception:
             pass
     return out
@@ -167,18 +187,31 @@ def touch(cli_session_id: str, last_ms: int | None, turns: int) -> list[Path]:
         f = cards_by_cli_id(reg).get(cli_session_id)
         if f is None:
             continue
-        card = json.loads(f.read_text())
+        card = json.loads(f.read_text(encoding="utf-8"))
         if last_ms:
             for k in ("lastActivityAt", "lastFocusedAt"):
                 card[k] = max(card.get(k) or 0, last_ms)
         card["completedTurns"] = (card.get("completedTurns") or 0) + turns
-        f.write_text(json.dumps(card, indent=2))
+        f.write_text(json.dumps(card, indent=2), encoding="utf-8")
         out.append(f)
     return out
 
 
 def desktop_running() -> bool:
-    return os.system("pgrep -qf '/Applications/Claude.app/Contents/MacOS/Claude'") == 0
+    if sys.platform == "win32":
+        # The CLI is claude.exe too, so only the app's Store install path counts.
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "(Get-Process Claude -ErrorAction SilentlyContinue).Path"],
+                capture_output=True, text=True, timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return any("windowsapps" in line.lower() and "claude" in line.lower()
+                   for line in out.stdout.splitlines())
+    return subprocess.run(["pgrep", "-qf", "/Applications/Claude.app/Contents/MacOS/Claude"],
+                          capture_output=True).returncode == 0
 
 
 if __name__ == "__main__":
