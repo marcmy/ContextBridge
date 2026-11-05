@@ -234,9 +234,8 @@ class TestCodexDiscovery(unittest.TestCase):
         if rollout_id:
             name += f"_{rollout_id}"
         path = self.tmp / (name + ".jsonl")
-        meta = {"id": thread_id, "timestamp": date.replace("T", "T").replace(
-                "T00-", "T00:").replace("-00-", ":00:"), "cwd": "/test",
-                "source": source}
+        meta = {"id": thread_id, "timestamp": date[:11] + date[11:].replace("-", ":") + "Z",
+                "cwd": "/test", "source": source}
         if base:
             meta["history_base"] = base
         rows = [{"type": "session_meta", "payload": meta}]
