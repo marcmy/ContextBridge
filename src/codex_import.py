@@ -299,8 +299,8 @@ def round_tripped_ids() -> dict[str, str]:
 # and a new rollout id after an underscore. Its history_base names the retained
 # ancestor prefix. Importing every file independently duplicates one conversation.
 ROLLOUT_RE = re.compile(
-    r"^rollout-\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}-"
-    r"([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\\.jsonl$", re.I)
+    r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-"
+    r"([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\.jsonl$", re.I)
 
 
 def rollout_id(path: Path) -> str | None:
@@ -388,7 +388,7 @@ def read_lineage(sess: dict) -> list[dict]:
     for path, cutoff in sess.get("lineage", [(sess["path"], None)]):
         raw = path.read_bytes()
         if cutoff is not None:
-            if cutoff > len(raw) or raw[cutoff - 1:cutoff] != b"\\n":
+            if cutoff > len(raw) or raw[cutoff - 1:cutoff] != b"\n":
                 raise ValueError(f"invalid history_base byte cutoff {cutoff} in {path}")
             raw = raw[:cutoff]
         records.extend(r for _, r in records_from(raw))
