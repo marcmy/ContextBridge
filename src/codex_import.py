@@ -817,6 +817,8 @@ def cmd_import(args):
         sys.exit("--summary-tokens must be between 1000 and 30000")
     if args.summary_max_usd <= 0:
         sys.exit("--summary-max-usd must be positive")
+    if args.summary_max_calls < 1:
+        sys.exit("--summary-max-calls must be positive")
     if args.summary_file and args.context_budget is None:
         sys.exit("--summary-file requires --context-budget")
     if args.summary_mode == "claude" and args.context_budget is None:
@@ -922,6 +924,7 @@ def cmd_import(args):
                             turns, model=args.summary_model,
                             max_tokens=args.summary_tokens,
                             max_usd_per_call=args.summary_max_usd,
+                            max_calls=args.summary_max_calls,
                             thread_id=s["id"])
                         summary_info.update(mode="claude", **ai_stats)
                     else:
@@ -1518,6 +1521,9 @@ def main():
                      help="Claude Code model alias for opt-in AI summarization (default: sonnet)")
     imp.add_argument("--summary-max-usd", type=float, default=2.0, metavar="USD",
                      help="Claude Code max-budget cap PER summary call (default: $2)")
+    imp.add_argument("--summary-max-calls", type=int, default=16, metavar="COUNT",
+                     help="safety cap on total Claude summary calls (default: 16); "
+                          "raise explicitly for very large omitted histories")
     imp.add_argument("--summary-file", metavar="PATH",
                      help="use a pre-written or reviewed history summary as a local text file")
     imp.add_argument("--replace", action="store_true",
