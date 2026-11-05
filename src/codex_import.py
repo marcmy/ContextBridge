@@ -808,12 +808,12 @@ def cmd_import(args):
         sessions = [s for s in sessions if s["id"] and s["id"].startswith(args.session)]
         if not sessions:
             sys.exit(f"No Codex session matching {args.session!r}")
+    elif not args.all:
+        sys.exit("Pass --all, or --session <id-prefix>. Use list to see them.")
     if args.context_budget is not None and args.context_budget < 5000:
         sys.exit("--context-budget must be at least 5000")
     if args.replace and (not args.session or len(sessions) != 1 or args.all or args.force):
         sys.exit("--replace requires exactly one --session, without --all/--force")
-    elif not args.all:
-        sys.exit("Pass --all, or --session <id-prefix>. Use `list` to see them.")
 
     # Threads already in Claude — ours, or Claude sessions Codex imported — get any
     # newer Codex turns appended instead of a second copy.
