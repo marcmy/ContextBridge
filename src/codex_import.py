@@ -821,7 +821,8 @@ def cmd_import(args):
         sys.exit("--summary-file requires --context-budget")
     if args.summary_mode == "claude" and args.context_budget is None:
         sys.exit("--summary-mode claude requires --context-budget")
-    if (args.context_budget is not None and args.summary_mode != "off"
+    if (args.context_budget is not None
+            and (args.summary_mode != "off" or args.summary_file)
             and args.context_budget <= args.summary_tokens + 4000):
         sys.exit("context budget must leave 4000 tokens beyond summary reserve")
     if args.replace and (not args.session or len(sessions) != 1 or args.all or args.force):
@@ -872,6 +873,12 @@ def cmd_import(args):
             print(f"skip {s['id'][:8]}  (cannot reconstruct history: "
                   f"{s['lineage_error']})")
             continue
+        old_target = None
+        if args.replace:
+            # Refuse overwriting native Claude work BEFORE any Claude summary calls.
+            old_entry = ledger[s["id"]]
+            old_target = Path(old_entry["transcript"])
+            verify_replace_target(old_target, old_entry, args.claude_dir)
         try:
             recs = read_lineage(s)
         except (OSError, ValueError) as err:
@@ -931,11 +938,7 @@ def cmd_import(args):
                 print(f"skip {s['id'][:8]}  (context summary failed: {err})")
                 continue
 
-        old_target = None
         if args.replace:
-            old_entry = ledger[s["id"]]
-            old_target = Path(old_entry["transcript"])
-            verify_replace_target(old_target, old_entry, args.claude_dir)
             for rec in out:
                 rec["sessionId"] = old_entry["claudeSessionId"]
             conv.session_id = old_entry["claudeSessionId"]
