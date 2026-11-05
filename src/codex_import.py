@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -62,6 +63,25 @@ EXTERNAL_TURN_PREFIX = "external-import-turn"
 
 # Where transcripts are copied before new Codex turns are appended to them.
 BACKUPS = Path.home() / ".claude" / "codex-import-backups"
+
+
+def configure_paths(codex_home: Path | str | None = None,
+                    claude_home: Path | str | None = None) -> None:
+    """Point every module-level location at alternate Codex/Claude homes.
+
+    ContextBridge resolves its roots once at start-up (tests and sandboxes use this
+    to stay away from the real ~/.codex and ~/.claude).
+    """
+    global CODEX_SESSIONS, CODEX_IMPORT_LEDGER, CLAUDE_PROJECTS, LEDGER, BACKUPS
+    if codex_home is not None:
+        codex_home = Path(codex_home)
+        CODEX_SESSIONS = codex_home / "sessions"
+        CODEX_IMPORT_LEDGER = codex_home / "external_agent_session_imports.json"
+    if claude_home is not None:
+        claude_home = Path(claude_home)
+        CLAUDE_PROJECTS = claude_home / "projects"
+        LEDGER = claude_home / "codex-imports.json"
+        BACKUPS = claude_home / "codex-import-backups"
 
 
 # ------------------------------------------------------- machine-preamble stripping
@@ -160,12 +180,49 @@ def slug_for(cwd: str) -> str:
 # ~/Documents/Codex/<date>/<thread-slug>. Imported as-is, each one becomes its own
 # folder in the Claude sidebar — ten threads, ten junk folders named after truncated
 # prompt slugs. They collapse to the shared parent instead.
-SCRATCH_RE = re.compile(r"^(?P<root>.*/Documents/Codex)/\d{4}-\d{2}-\d{2}/[^/]+/?$")
+SCRATCH_RE = re.compile(
+    r"^(?P<root>.*[/\\]Documents[/\\]Codex)[/\\]\d{4}-\d{2}-\d{2}[/\\][^/\\]+[/\\]?$")
 
 
 def group_scratch(cwd: str) -> str:
     m = SCRATCH_RE.match(cwd or "")
     return m.group("root") if m else cwd
+
+
+def normalize_path(raw: str | os.PathLike | None) -> str:
+    """Strip Windows extended-length prefixes Codex stores in its ledger and state DB."""
+    text = os.fspath(raw) if raw else ""
+    if text.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + text[8:]
+    if text.startswith("\\\\?\\"):
+        return text[4:]
+    return text
+
+
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write through a sibling temp file: readers see the old or new file, never half."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        with temp.open("wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        temp.replace(path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def durable_append(path: Path, data: bytes) -> None:
+    """Append bytes and flush them to disk; line endings are written as given."""
+    with path.open("ab") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def jsonl_bytes(lines: list[str]) -> bytes:
+    return ("\n".join(lines) + "\n").encode("utf-8")
 
 
 def iso(ts: str | None) -> str:
@@ -230,6 +287,85 @@ def unwrap_exec(raw: str) -> str:
 
 # ----------------------------------------------------------------------- discovery
 
+def _zstd():
+    """Codex compresses settled rollouts with zstd. Python 3.14+ ships a codec; older
+    interpreters need the `zstandard` package (a declared dependency below 3.14)."""
+    try:
+        from compression import zstd
+        return zstd
+    except ImportError:
+        pass
+    try:
+        import zstandard
+    except ImportError as exc:
+        raise RuntimeError(
+            "This rollout is zstd-compressed. Use Python 3.14+ or "
+            "`pip install zstandard` to read it.") from exc
+
+    class _Shim:
+        @staticmethod
+        def decompress(data: bytes) -> bytes:
+            import io
+            with zstandard.ZstdDecompressor().stream_reader(
+                    io.BytesIO(data), read_across_frames=True) as reader:
+                return reader.read()
+
+        @staticmethod
+        def compress(data: bytes) -> bytes:
+            return zstandard.ZstdCompressor().compress(data)
+
+        @staticmethod
+        def open(path, mode="rb"):
+            import io
+            raw = open(path, "rb")
+            reader = zstandard.ZstdDecompressor().stream_reader(
+                raw, closefd=True, read_across_frames=True)
+            return io.BufferedReader(reader)
+    return _Shim
+
+
+def is_compressed(path: Path) -> bool:
+    return Path(path).name.endswith(".zst")
+
+
+def rollout_bytes(path: Path) -> bytes:
+    """The rollout's JSONL content. Byte offsets everywhere refer to these bytes,
+    which is also what Codex's history_base cutoffs count."""
+    raw = Path(path).read_bytes()
+    return _zstd().decompress(raw) if is_compressed(Path(path)) else raw
+
+
+def open_rollout(path: Path):
+    """Binary stream of decoded JSONL, without loading a compressed file whole."""
+    path = Path(path)
+    return _zstd().open(path, "rb") if is_compressed(path) else path.open("rb")
+
+
+def uncompressed_name(path: Path | str) -> str:
+    """A rollout keeps its identity when Codex later compresses it in place."""
+    text = normalize_path(path)
+    return text[:-4] if text.endswith(".zst") else text
+
+
+def same_rollout(a: Path | str, b: Path | str) -> bool:
+    return uncompressed_name(a).lower() == uncompressed_name(b).lower()
+
+
+def locate_rollout(recorded: Path | str) -> Path:
+    """Where a recorded rollout lives now: Codex compresses settled rollouts in place
+    and `codex archive` moves them, without either changing what they contain."""
+    path = Path(normalize_path(recorded))
+    bare = path.name[:-4] if path.name.endswith(".zst") else path.name
+    candidates = [path.with_name(bare), path.with_name(bare + ".zst")]
+    archived = CODEX_SESSIONS.parent / "archived_sessions"
+    candidates += [archived / bare, archived / (bare + ".zst")]
+    return next((c for c in candidates if c.is_file()), path)
+
+
+def rollout_length(path: Path) -> int:
+    return len(rollout_bytes(path)) if is_compressed(Path(path)) else Path(path).stat().st_size
+
+
 def records_from(data: bytes, start: int = 0) -> list[tuple[int, dict]]:
     """(offset just past the line, record) for each complete JSON line in data[start:].
 
@@ -252,7 +388,7 @@ def records_from(data: bytes, start: int = 0) -> list[tuple[int, dict]]:
 
 
 def read_rollout(path: Path) -> list[dict]:
-    return [r for _, r in records_from(path.read_bytes())]
+    return [r for _, r in records_from(rollout_bytes(path))]
 
 
 def external_import_end(recs: list[tuple[int, dict]]) -> int | None:
@@ -289,11 +425,11 @@ def prefix_offset(data: bytes, digest: str) -> int | None:
 def round_tripped_ids() -> dict[str, str]:
     """Codex thread id -> the Claude transcript it was originally imported from."""
     try:
-        data = json.loads(CODEX_IMPORT_LEDGER.read_text())
+        data = json.loads(CODEX_IMPORT_LEDGER.read_text(encoding="utf-8"))
     except Exception:
         return {}
     recs = data.get("records", data if isinstance(data, list) else [])
-    return {r["imported_thread_id"]: r.get("source_path", "")
+    return {r["imported_thread_id"]: normalize_path(r.get("source_path", ""))
             for r in recs if r.get("imported_thread_id")}
 
 
@@ -302,7 +438,11 @@ def round_tripped_ids() -> dict[str, str]:
 # ancestor prefix. Importing every file independently duplicates one conversation.
 ROLLOUT_RE = re.compile(
     r"^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-"
-    r"([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\.jsonl$", re.I)
+    r"([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\.jsonl(?:\.zst)?$", re.I)
+
+# thread_source values Codex gives to threads no human started (state DB and rollouts).
+INTERNAL_THREAD_SOURCES = {"subagent", "internal", "guardian", "guardian_review",
+                           "security_scan", "memory_consolidation"}
 
 
 def rollout_id(path: Path) -> str | None:
@@ -313,8 +453,16 @@ def rollout_id(path: Path) -> str | None:
 def is_internal_session(meta: dict) -> bool:
     """Detect Codex subagents and internal reviewers from session metadata."""
     for source in (meta.get("source"), meta.get("thread_source")):
-        if isinstance(source, str) and source.lower() in ("subagent", "internal", "guardian"):
-            return True
+        if isinstance(source, str):
+            text = source.strip()
+            if not text.startswith("{"):
+                if text.lower() in INTERNAL_THREAD_SOURCES:
+                    return True
+                continue
+            try:                          # the state DB stores `source` as JSON text
+                source = json.loads(text)
+            except ValueError:
+                continue
         if isinstance(source, dict) and (
             "subagent" in source or "subAgent" in source or "internal" in source
             or source.get("type") in ("subagent", "internal", "guardian")
@@ -324,15 +472,22 @@ def is_internal_session(meta: dict) -> bool:
 
 
 def summarize(path: Path) -> dict | None:
-    """Read header and title while retaining fields needed for rollout lineage."""
+    """Read header and title while retaining fields needed for rollout lineage.
+
+    Compressed rollouts stop at the first few user turns: decoding hundreds of
+    settled files just to count their lines would make listing take minutes.
+    """
     meta, n = None, 0
     candidates: list[str] = []
-    with path.open(errors="replace") as fh:
-        for line in fh:
+    compressed = is_compressed(path)
+    with open_rollout(path) as fh:
+        for raw in fh:
             n += 1
             if meta and len(candidates) >= 6:
+                if compressed:
+                    break
                 continue
-            line = line.strip()
+            line = raw.strip()
             if not line:
                 continue
             try:
@@ -340,7 +495,10 @@ def summarize(path: Path) -> dict | None:
             except Exception:
                 continue
             if r.get("type") == "session_meta":
-                meta = r.get("payload", {})
+                if meta is None or (r.get("payload") or {}).get("id") == meta.get("id"):
+                    meta = r.get("payload", {})
+                if compressed and is_internal_session(meta):
+                    break
             elif (len(candidates) < 6 and r.get("type") == "response_item"
                   and r.get("payload", {}).get("type") == "message"
                   and r["payload"].get("role") == "user"):
@@ -350,9 +508,11 @@ def summarize(path: Path) -> dict | None:
     return {"path": path, "id": meta.get("id") or meta.get("session_id"),
             "rollout_id": rollout_id(path),
             "history_base": meta.get("history_base"),
+            "forked_from": meta.get("forked_from_id"),
             "internal": is_internal_session(meta),
             "cwd": meta.get("cwd", ""), "ts": meta.get("timestamp", ""),
-            "originator": meta.get("originator", ""), "lines": n,
+            "originator": meta.get("originator", ""),
+            "lines": None if compressed else n,
             "first_user": next((t for t in (clean_title(c) for c in candidates) if t), "")}
 
 
@@ -388,7 +548,7 @@ def read_lineage(sess: dict) -> list[dict]:
         raise ValueError(sess["lineage_error"])
     records = []
     for path, cutoff in sess.get("lineage", [(sess["path"], None)]):
-        raw = path.read_bytes()
+        raw = rollout_bytes(path)
         if cutoff is not None:
             if cutoff > len(raw) or raw[cutoff - 1:cutoff] != b"\n":
                 raise ValueError(f"invalid history_base byte cutoff {cutoff} in {path}")
@@ -399,8 +559,12 @@ def read_lineage(sess: dict) -> list[dict]:
 
 def discover(root: Path, include_internal: bool = False) -> list[dict]:
     all_sessions = []
-    for p in sorted(root.rglob("*.jsonl")):
-        s = summarize(p)
+    for p in sorted([*root.rglob("*.jsonl"), *root.rglob("*.jsonl.zst")]):
+        try:
+            s = summarize(p)
+        except (OSError, EOFError, ValueError, RuntimeError) as err:
+            print(f"! unreadable rollout {p.name}: {err}", file=sys.stderr)
+            continue
         if s:
             all_sessions.append(s)
     rollouts = {s["rollout_id"]: s for s in all_sessions if s["rollout_id"]}
@@ -430,15 +594,14 @@ def discover(root: Path, include_internal: bool = False) -> list[dict]:
 def load_ledger() -> dict:
     for path in (LEDGER, LEGACY_LEDGER):
         try:
-            return json.loads(path.read_text())
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
     return {}
 
 
 def save_ledger(d: dict) -> None:
-    LEDGER.parent.mkdir(parents=True, exist_ok=True)
-    LEDGER.write_text(json.dumps(d, indent=2, sort_keys=True))
+    atomic_write_bytes(LEDGER, json.dumps(d, indent=2, sort_keys=True).encode("utf-8"))
     if LEGACY_LEDGER.exists():
         LEGACY_LEDGER.unlink()
 
@@ -688,7 +851,7 @@ CHAIN_TYPES = {"user", "assistant", "system", "attachment"}
 def transcript_tail(path: Path) -> dict:
     """Where an existing Claude transcript's conversation ends, and what it is called."""
     info = {"leaf": None, "cwd": None, "sessionId": None, "title": None, "lastTs": ""}
-    with path.open(errors="replace") as fh:
+    with path.open(encoding="utf-8", errors="replace") as fh:
         for line in fh:
             try:
                 r = json.loads(line)
@@ -720,7 +883,22 @@ def append_codex_turns(sess: dict, data: bytes, start: int, target: Path, *, mod
     `native` means the transcript is a Claude session rather than one this tool wrote,
     so no import title/provenance record is appended to it.
     """
-    recs = records_from(data, start)
+    return append_codex_records(sess, records_from(data, start), start, target, mode=mode,
+                                keep_developer=keep_developer, version=version,
+                                banner=banner, native=native, dry_run=dry_run,
+                                digest_of=lambda end: hashlib.sha256(data[:end]).hexdigest())
+
+
+def append_codex_records(sess: dict, recs: list[tuple[int, dict]], start: int, target: Path,
+                         *, mode: str, keep_developer: bool, version: str,
+                         banner: bool = True, native: bool = False, dry_run: bool = False,
+                         digest_of=None, transform=None) -> dict:
+    """Records-based core of append_codex_turns.
+
+    `recs` are (offset past the line, record) pairs not yet in `target`; `digest_of`
+    fingerprints the source up to an offset. `transform`, when given, may rewrite the
+    converted records (bounded handoffs shorten large tool output) before validation.
+    """
     result = {"end": recs[-1][0] if recs else start, "out": [], "errs": [],
               "backup": None, "tail": None}
     content = [r for _, r in recs if r.get("type") == "response_item"
@@ -740,6 +918,8 @@ def append_codex_turns(sess: dict, data: bytes, start: int, target: Path, *, mod
     out = conv.run([r for _, r in recs])
     if len(out) == n0:
         return result
+    if transform:
+        out = transform(out)
     result.update(out=out, errs=validate(out, root=tail["leaf"]), stats=conv.stats,
                   first=first, last=last, sessionId=conv.session_id)
 
@@ -750,7 +930,7 @@ def append_codex_turns(sess: dict, data: bytes, start: int, target: Path, *, mod
     lines.append(json.dumps({"type": "last-prompt", "lastPrompt": (said or [""])[-1][:200],
                              "leafUuid": out[-1]["uuid"], "sessionId": conv.session_id},
                             ensure_ascii=False))
-    digest = hashlib.sha256(data[:result["end"]]).hexdigest()
+    digest = digest_of(result["end"]) if digest_of else None
     result["digest"] = digest
     if not native:
         lines.append(json.dumps({
@@ -762,16 +942,15 @@ def append_codex_turns(sess: dict, data: bytes, start: int, target: Path, *, mod
             "importToolVersion": TOOL_VERSION,
         }, ensure_ascii=False))
 
-    if not dry_run:
+    if not dry_run and not result["errs"]:
         BACKUPS.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
         backup = BACKUPS / f"{target.stem}.{stamp}.jsonl"
-        backup.write_bytes(existing := target.read_bytes())
+        existing = target.read_bytes()
+        atomic_write_bytes(backup, existing)
         result["backup"] = backup
-        with target.open("a") as fh:
-            if existing and not existing.endswith(b"\n"):
-                fh.write("\n")
-            fh.write("\n".join(lines) + "\n")
+        prefix = b"\n" if existing and not existing.endswith(b"\n") else b""
+        durable_append(target, prefix + jsonl_bytes(lines))
     return result
 
 
@@ -797,7 +976,8 @@ def cmd_list(args):
                         else "already imported")
         tag = f"  [{'; '.join(tags)}]" if tags else ""
         print(f"  {s['id']}{tag}")
-        print(f"    {s['ts'][:19]}  {s['lines']:>6} lines  {s['originator']}")
+        lines = "zstd" if s["lines"] is None else f"{s['lines']} lines"
+        print(f"    {s['ts'][:19]}  {lines:>12}  {s['originator']}")
         print(f"    cwd: {s['cwd'] or '(none)'}")
         print(f"    {s['first_user'] or '(no user message)'}")
         print()
@@ -871,118 +1051,27 @@ def cmd_import(args):
               "reopen afterwards.\n")
 
     for s in sessions:
-        if s.get("lineage_error"):
-            print(f"skip {s['id'][:8]}  (cannot reconstruct history: "
-                  f"{s['lineage_error']})")
-            continue
         old_target = None
-        if args.replace:
+        old_entry = None
+        if not s.get("lineage_error") and args.replace:
             # Refuse overwriting native Claude work BEFORE any Claude summary calls.
             old_entry = ledger[s["id"]]
             old_target = Path(old_entry["transcript"])
             verify_replace_target(old_target, old_entry, args.claude_dir)
         try:
-            recs = read_lineage(s)
-        except (OSError, ValueError) as err:
-            print(f"skip {s['id'][:8]}  (cannot reconstruct history: {err})")
+            built = build_import(s, args, version, replace_entry=old_entry)
+        except ImportSkipped as err:
+            print(f"skip {s['id'][:8]}  ({err})")
             continue
-        # Sync offsets refer to the active rollout only, not concatenated ancestry.
-        data = s["path"].read_bytes()
-        parsed = records_from(data)
-        consumed = parsed[-1][0] if parsed else 0
-        cwd = s["cwd"] or str(Path.home())
-        if not args.no_group_scratch:
-            cwd = group_scratch(cwd)
-        conv = Converter(s, args.mode, args.keep_developer, version, cwd)
-        if not args.no_banner:
-            conv.emit_user(provenance_banner(s, args.mode), s["ts"], meta=True)
-        out = conv.run(recs)
-        if not has_conversation(conv.stats):
-            print(f"skip {s['id'][:8]}  (no human conversation content)")
-            continue
-        budget_info = None
-        summary_info = None
-        if args.context_budget is not None:
-            try:
-                original_out = out
-                with_summary = (args.summary_mode != "off" or bool(args.summary_file))
-                reserve = args.summary_tokens if with_summary else 0
-                preview, _ = fit_context(original_out, args.context_budget,
-                                         max_tool_chars=args.max_tool_chars,
-                                         summary_reserve_tokens=reserve)
-                keep_uuids = {r["uuid"] for r in preview if r.get("uuid")}
-                earlier = [r for r in original_out if r.get("uuid") not in keep_uuids]
-                turns = evidence_turns(earlier)
-                summary = None
-                summary_info = {"mode": "off", "turns": len(turns)}
-                if earlier and with_summary:
-                    if args.summary_file:
-                        summary = Path(args.summary_file).read_text(encoding="utf-8")
-                        summary_info["mode"] = "file"
-                    elif args.summary_mode == "claude" and not args.dry_run:
-                        summary, ai_stats = claude_summary(
-                            turns, model=args.summary_model,
-                            max_tokens=args.summary_tokens,
-                            max_usd_per_call=args.summary_max_usd,
-                            max_calls=args.summary_max_calls,
-                            thread_id=s["id"])
-                        summary_info.update(mode="claude", **ai_stats)
-                    else:
-                        summary = offline_digest(turns, max_tokens=args.summary_tokens)
-                        summary_info["mode"] = "index"
-                        if args.summary_mode == "claude":
-                            summary_info["dry_run_skipped_claude"] = True
-                    if not summary or not summary.strip():
-                        raise ValueError("history summary was empty")
-                out, budget_info = fit_context(
-                    original_out, args.context_budget, max_tool_chars=args.max_tool_chars,
-                    historical_summary=summary, summary_reserve_tokens=reserve)
-            except (ValueError, RuntimeError, OSError) as err:
-                print(f"skip {s['id'][:8]}  (context summary failed: {err})")
-                continue
-
-        if args.replace:
-            for rec in out:
-                rec["sessionId"] = old_entry["claudeSessionId"]
-            conv.session_id = old_entry["claudeSessionId"]
-        errs = validate(out)
-        if errs:
-            print(f"skip {s['id'][:8]}  (transcript validation failed: {errs[:3]})")
-            continue
+        conv, out, cwd, title = built["conv"], built["out"], built["cwd"], built["title"]
+        budget_info, summary_info, errs = built["budget"], built["summary"], built["errs"]
         target_dir = Path(args.claude_dir) / slug_for(cwd)
         target = old_target or target_dir / f"{conv.session_id}.jsonl"
 
-        base = s["first_user"] or "Codex import"
-        title = f"{args.title_prefix}{base}" if args.title_prefix else base
-        lines = [json.dumps(r, ensure_ascii=False) for r in out]
-        digest = hashlib.sha256(data[:consumed]).hexdigest()
-        lines.append(json.dumps({
-            "type": "custom-title", "customTitle": title,
-            "sessionId": conv.session_id,
-            # Provenance, carried in the transcript itself so it survives losing the
-            # ledger, moving the file, or deleting this checkout.
-            "importedFrom": IMPORT_MARK,
-            "codexThreadId": s["id"],
-            "codexRollout": str(s["path"]),
-            "codexRolloutSha256": digest,
-            "importedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "importMode": args.mode,
-            "importToolVersion": TOOL_VERSION,
-        }, ensure_ascii=False))
-
         if not args.dry_run:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if old_target is not None:
-                BACKUPS.mkdir(parents=True, exist_ok=True)
-                stamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
-                backup = BACKUPS / f"{target.stem}.{stamp}.jsonl"
-                backup.write_bytes(target.read_bytes())
-                temp = target.with_name(target.name + ".tmp")
-                temp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-                temp.replace(target)
+            backup = write_import(target, built["lines"], replace=old_target is not None)
+            if backup:
                 print(f"    original backed up: {backup}")
-            else:
-                target.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         card = None
         if args.desktop:
@@ -1017,26 +1106,144 @@ def cmd_import(args):
             print(f"    desktop card: {card.name if card else '! registry not found'}")
 
         if not args.dry_run:
-            ledger[s["id"]] = {
-                "claudeSessionId": conv.session_id,
-                "transcript": str(target),
-                "card": str(card) if card else None,
-                "cwd": cwd,
-                "title": title,
-                "importedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "sourceRollout": str(s["path"]),
-                "sourceSha256": digest,
-                "sourceMtime": int(s["path"].stat().st_mtime),
-                "sourceBytes": consumed,
-                "kind": "import",
-                "mode": args.mode,
-                "contextBudget": args.context_budget,
-                "summaryMode": summary_info["mode"] if summary_info else "off",
-                "summaryTokens": args.summary_tokens if summary_info else None,
-                "toolVersion": TOOL_VERSION,
-            }
+            ledger[s["id"]] = ledger_entry(s, built, target, card, args)
             save_ledger(ledger)
         print()
+
+
+class ImportSkipped(Exception):
+    """A session cannot be converted; the message says why, nothing was written."""
+
+
+def build_import(s: dict, args, version: str, replace_entry: dict | None = None,
+                 extra_banner: str | None = None) -> dict:
+    """Convert one Codex thread to Claude records, in memory, writing nothing.
+
+    Shared by the CLI and ContextBridge. `args` needs the import option attributes.
+    A dry-run swaps Claude summaries for the offline digest, so previews stay free.
+    """
+    if s.get("lineage_error"):
+        raise ImportSkipped(f"cannot reconstruct history: {s['lineage_error']}")
+    try:
+        recs = read_lineage(s)
+        # Sync offsets refer to the active rollout only, not concatenated ancestry.
+        data = rollout_bytes(s["path"])
+    except (OSError, ValueError, RuntimeError) as err:
+        raise ImportSkipped(f"cannot reconstruct history: {err}") from err
+    parsed = records_from(data)
+    consumed = parsed[-1][0] if parsed else 0
+    cwd = normalize_path(s["cwd"]) or str(Path.home())
+    if not args.no_group_scratch:
+        cwd = group_scratch(cwd)
+    conv = Converter(s, args.mode, args.keep_developer, version, cwd)
+    if not args.no_banner:
+        conv.emit_user(provenance_banner(s, args.mode), s["ts"], meta=True)
+    if extra_banner:
+        conv.emit_user(extra_banner, s["ts"], meta=True)
+    out = conv.run(recs)
+    if not has_conversation(conv.stats):
+        raise ImportSkipped("no human conversation content")
+    budget_info = None
+    summary_info = None
+    if args.context_budget is not None:
+        try:
+            original_out = out
+            with_summary = (args.summary_mode != "off" or bool(args.summary_file))
+            reserve = args.summary_tokens if with_summary else 0
+            preview, _ = fit_context(original_out, args.context_budget,
+                                     max_tool_chars=args.max_tool_chars,
+                                     summary_reserve_tokens=reserve)
+            keep_uuids = {r["uuid"] for r in preview if r.get("uuid")}
+            earlier = [r for r in original_out if r.get("uuid") not in keep_uuids]
+            turns = evidence_turns(earlier)
+            summary = None
+            summary_info = {"mode": "off", "turns": len(turns)}
+            if earlier and with_summary:
+                if args.summary_file:
+                    summary = Path(args.summary_file).read_text(encoding="utf-8")
+                    summary_info["mode"] = "file"
+                elif args.summary_mode == "claude" and not args.dry_run:
+                    summary, ai_stats = claude_summary(
+                        turns, model=args.summary_model,
+                        max_tokens=args.summary_tokens,
+                        max_usd_per_call=args.summary_max_usd,
+                        max_calls=args.summary_max_calls,
+                        thread_id=s["id"])
+                    summary_info.update(mode="claude", **ai_stats)
+                else:
+                    summary = offline_digest(turns, max_tokens=args.summary_tokens)
+                    summary_info["mode"] = "index"
+                    if args.summary_mode == "claude":
+                        summary_info["dry_run_skipped_claude"] = True
+                if not summary or not summary.strip():
+                    raise ValueError("history summary was empty")
+            out, budget_info = fit_context(
+                original_out, args.context_budget, max_tool_chars=args.max_tool_chars,
+                historical_summary=summary, summary_reserve_tokens=reserve)
+        except (ValueError, RuntimeError, OSError) as err:
+            raise ImportSkipped(f"context summary failed: {err}") from err
+
+    if replace_entry:
+        for rec in out:
+            rec["sessionId"] = replace_entry["claudeSessionId"]
+        conv.session_id = replace_entry["claudeSessionId"]
+    errs = validate(out)
+    if errs:
+        raise ImportSkipped(f"transcript validation failed: {errs[:3]}")
+
+    base = s["first_user"] or "Codex import"
+    title = f"{args.title_prefix}{base}" if args.title_prefix else base
+    lines = [json.dumps(r, ensure_ascii=False) for r in out]
+    digest = hashlib.sha256(data[:consumed]).hexdigest()
+    lines.append(json.dumps({
+        "type": "custom-title", "customTitle": title,
+        "sessionId": conv.session_id,
+        # Provenance, carried in the transcript itself so it survives losing the
+        # ledger, moving the file, or deleting this checkout.
+        "importedFrom": IMPORT_MARK,
+        "codexThreadId": s["id"],
+        "codexRollout": str(s["path"]),
+        "codexRolloutSha256": digest,
+        "importedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "importMode": args.mode,
+        "importToolVersion": TOOL_VERSION,
+    }, ensure_ascii=False))
+    return {"conv": conv, "out": out, "cwd": cwd, "title": title, "lines": lines,
+            "digest": digest, "consumed": consumed, "budget": budget_info,
+            "summary": summary_info, "errs": errs}
+
+
+def write_import(target: Path, lines: list[str], *, replace: bool = False) -> Path | None:
+    """Atomically create or (after a backup) replace a transcript. Returns the backup."""
+    backup = None
+    if replace:
+        BACKUPS.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+        backup = BACKUPS / f"{target.stem}.{stamp}.jsonl"
+        atomic_write_bytes(backup, target.read_bytes())
+    atomic_write_bytes(target, jsonl_bytes(lines))
+    return backup
+
+
+def ledger_entry(s: dict, built: dict, target: Path, card, args) -> dict:
+    return {
+        "claudeSessionId": built["conv"].session_id,
+        "transcript": str(target),
+        "card": str(card) if card else None,
+        "cwd": built["cwd"],
+        "title": built["title"],
+        "importedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "sourceRollout": str(s["path"]),
+        "sourceSha256": built["digest"],
+        "sourceMtime": int(s["path"].stat().st_mtime),
+        "sourceBytes": built["consumed"],
+        "kind": "import",
+        "mode": args.mode,
+        "contextBudget": args.context_budget,
+        "summaryMode": built["summary"]["mode"] if built["summary"] else "off",
+        "summaryTokens": args.summary_tokens if built["summary"] else None,
+        "toolVersion": TOOL_VERSION,
+    }
 
 
 def verify_replace_target(target: Path, entry: dict, claude_dir: str) -> None:
@@ -1097,16 +1304,16 @@ def sync_one(s: dict, entry: dict | None, args, version: str, ledger: dict,
     # A revert replaces the active rollout and can change/remove earlier turns.
     # Appending new revision bytes to the old Claude session would corrupt history.
     if (entry and entry.get("sourceRollout")
-            and Path(entry["sourceRollout"]) != s["path"]):
+            and not same_rollout(entry["sourceRollout"], s["path"])):
         print(f"skip {tid[:8]}  (Codex rollout revision changed; "
               "use import --force to import the new revision separately)")
         return
     native = entry is None or entry.get("kind") == "round-trip"
-    size = s["path"].stat().st_size
+    size = rollout_length(s["path"])
     if entry and entry.get("sourceBytes") == size:
         state["current"] += 1
         return
-    data = s["path"].read_bytes()
+    data = rollout_bytes(s["path"])
     if entry and entry.get("sourceBytes") is not None:
         start = entry["sourceBytes"]
     elif entry:
@@ -1150,6 +1357,10 @@ def sync_one(s: dict, entry: dict | None, args, version: str, ledger: dict,
                              keep_developer=args.keep_developer, version=version,
                              banner=not args.no_banner, native=native,
                              dry_run=args.dry_run)
+    if res["errs"]:
+        print(f"skip {tid[:8]}  (converted turns failed validation; nothing was "
+              f"appended: {res['errs'][:3]})")
+        return
     if not res["out"]:
         state["current"] += 1
         if entry and not args.dry_run and entry.get("sourceBytes") != res["end"]:
@@ -1253,7 +1464,7 @@ def cmd_uninstall(args):
     if reg:
         for f in reg.glob("local_*.json"):
             try:
-                cards[json.loads(f.read_text()).get("cliSessionId")] = f
+                cards[json.loads(f.read_text(encoding="utf-8")).get("cliSessionId")] = f
             except Exception:
                 pass
 
@@ -1282,7 +1493,7 @@ def cmd_uninstall(args):
         dead = []
         for f in reg.glob("local_*.json"):
             try:
-                d = json.loads(f.read_text())
+                d = json.loads(f.read_text(encoding="utf-8"))
             except Exception:
                 continue
             cli = d.get("cliSessionId")
@@ -1310,7 +1521,7 @@ def dead_cards(claude_dir: str) -> list[tuple[Path, str]]:
         return out
     for f in sorted(reg.glob("local_*.json")):
         try:
-            d = json.loads(f.read_text())
+            d = json.loads(f.read_text(encoding="utf-8"))
         except Exception:
             continue
         cli = d.get("cliSessionId")
@@ -1364,7 +1575,7 @@ def cmd_status(args):
     if reg:
         for f in reg.glob("local_*.json"):
             try:
-                cards[json.loads(f.read_text()).get("cliSessionId")] = f
+                cards[json.loads(f.read_text(encoding="utf-8")).get("cliSessionId")] = f
             except Exception:
                 pass
 
@@ -1372,7 +1583,7 @@ def cmd_status(args):
     issues = 0
     for tid, v in sorted(ledger.items(), key=lambda kv: kv[1]["importedAt"]):
         t = Path(v["transcript"])
-        src = Path(v.get("sourceRollout", ""))
+        src = locate_rollout(v.get("sourceRollout", ""))
         card = Path(v["card"]) if v.get("card") else cards.get(t.stem)
         notes = []
         if not t.exists():
@@ -1381,7 +1592,7 @@ def cmd_status(args):
             notes.append("no desktop card")
         if not src.exists():
             notes.append("source rollout gone")
-        elif (src.stat().st_size != v["sourceBytes"] if v.get("sourceBytes") is not None
+        elif (rollout_length(src) != v["sourceBytes"] if v.get("sourceBytes") is not None
               else v.get("sourceMtime") and int(src.stat().st_mtime) != v["sourceMtime"]):
             notes.append("source rollout changed since import")
         issues += bool(notes)
@@ -1446,7 +1657,7 @@ def cmd_move_account(args):
     by_claude_id = {v["claudeSessionId"]: tid for tid, v in ledger.items()}
     moved = skipped = missing = 0
     for f in sorted(src.glob("local_*.json"), key=lambda p: p.stat().st_mtime):
-        card = json.loads(f.read_text())
+        card = json.loads(f.read_text(encoding="utf-8"))
         cli = card.get("cliSessionId")
         title = card.get("title", "")[:60]
         if cli in have:
@@ -1463,7 +1674,7 @@ def cmd_move_account(args):
         moved += 1
         if args.dry_run:
             continue
-        target.write_text(json.dumps(entry, indent=2))
+        target.write_text(json.dumps(entry, indent=2), encoding="utf-8")
         if args.remove_source:
             f.unlink()
         if cli in by_claude_id:
