@@ -15,8 +15,9 @@ SCANNER_VERSION = 3
 
 _SKIP_TYPES = (b'"type":"api-request', b'"type": "api-request')
 _FINGERPRINT_TURNS = 5
-SYNTHETIC_MODELS = {ci.IMPORT_MODEL, "<synthetic>"}
-_NOT_HUMAN = ("[Request interrupted", "<task-notification", "Caveat: ")
+SYNTHETIC_MODELS = ci.SYNTHETIC_MODELS
+_NOT_HUMAN = ci.NOT_HUMAN_PREFIXES
+human_text = ci.human_text
 
 
 def _normal(text: str) -> str:
@@ -29,27 +30,6 @@ def fingerprint_of(prompts: list[str]) -> str:
         return ""
     joined = "␞".join(_normal(p)[:2000] for p in prompts[:_FINGERPRINT_TURNS])
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
-
-
-def human_text(rec: dict) -> str | None:
-    """The text a person typed in a Claude `user` record, or None for anything else."""
-    if rec.get("type") != "user" or rec.get("isMeta") or rec.get("isSidechain"):
-        return None
-    origin = rec.get("origin")
-    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
-        return None
-    content = (rec.get("message") or {}).get("content")
-    if isinstance(content, list):
-        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
-            return None
-        content = "\n".join(b.get("text", "") for b in content
-                            if isinstance(b, dict) and b.get("type") == "text")
-    if not isinstance(content, str) or not content.strip():
-        return None
-    if content.lstrip().startswith(_NOT_HUMAN):
-        return None
-    human = ci.split_user_message(content)[1]
-    return human or None
 
 
 def _assistant_model(rec: dict) -> str | None:
@@ -145,19 +125,13 @@ def scan_claude(path: Path, start: int = 0, since_ts: str = "") -> dict:
             info["first_human"] = info["first_human"] or said
             # A converted turn in a sync is not native work either, but those carry
             # their assistant replies with the import model, so only count real ones.
-            if rec.get("entrypoint") != "cli" or not _is_converter_record(rec):
+            if not ci.is_converter_record(rec):
                 info["native_after_mark"] += 1
                 info["native_chain"] += 1
                 info["native_human"] += 1
     info["open_tool_use"] = bool(open_tools)
     info["fingerprint"] = fingerprint_of(prompts)
     return info
-
-
-def _is_converter_record(rec: dict) -> bool:
-    """Records the converter emits have exactly its envelope; live Claude Code records
-    always add fields such as `promptId` or `origin`."""
-    return not ({"promptId", "origin", "promptSource", "permissionMode"} & rec.keys())
 
 
 def scan_rollout_bytes(data: bytes, start: int = 0) -> dict:

@@ -277,7 +277,9 @@ Either way, `import --all` appends the Codex turns Claude doesn't have yet to th
 transcript that already holds the thread, chained onto its latest message, so it
 stays one conversation you can resume. A background banner marks where the Codex part
 starts, and the desktop card's activity time moves up to the last Codex turn. If the
-Claude side moved on too, the Codex turns follow its latest message. Nothing already
+Claude side moved on too, the thread is skipped and nothing is written, so histories never
+merge silently; `--allow-divergent` appends anyway, and
+`contextbridge send <id> --strategy continuation --yes` keeps them apart. Nothing already
 in the transcript is touched; a copy is saved to `~/.claude/codex-import-backups/`
 first.
 
@@ -314,6 +316,7 @@ recall the Codex-side history.
 | `--desktop` | also register with the Claude desktop app so it shows in the sidebar |
 | `--force` | re-import sessions already in the ledger as a fresh copy |
 | `--no-sync` | don't append newer Codex turns to threads already in Claude |
+| `--allow-divergent` | append newer Codex turns even if the Claude session has its own newer work (default: skip that thread) |
 | `--title-prefix '[codex] '` | mark imported titles (default: unmarked) |
 | `--no-group-scratch` | keep Codex scratch dirs as separate sidebar folders |
 | `--no-banner` | skip the visible provenance banner (metadata still recorded) |
