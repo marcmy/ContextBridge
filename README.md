@@ -121,6 +121,63 @@ Incremental synchronization is disabled for budgeted imports: rerun the same
 If you already continued the imported conversation in Claude, preserve that
 Claude work and create a *separate* bounded import using `--force` instead.
 
+### Preserve the decisions in omitted older turns
+
+A context budget does not need to mean discarding every earlier decision. A
+bounded import can now include an evidence-backed digest of the omitted history,
+before the newer full conversation turns.
+
+The default `--summary-mode index` is **entirely offline**: it copies labeled
+excerpts of earlier user requests, assistant outcomes and diagnostic tool output
+without invoking an LLM. It is explicitly an evidence index, **not a claim that
+the project was semantically summarized**.
+
+For a richer summary, explicitly opt in to `--summary-mode claude`:
+
+```powershell
+# Preview: zero Claude calls, zero file writes.
+python3 src/codex_import.py import --session 01a1ab29 --mode faithful --context-budget 400000 --summary-mode claude --summary-tokens 8000 --summary-model sonnet --force --dry-run
+
+# Real run: Claude Code CLI synthesizes evidence-cited historical summaries.
+python3 src/codex_import.py import --session 01a1ab29 --mode faithful --context-budget 400000 --summary-mode claude --summary-tokens 8000 --summary-model sonnet --force
+```
+
+This uses `claude -p` without tools or persisted sessions, and sends **omitted
+Codex transcript excerpts** to your configured Claude account. It therefore
+consumes Claude Code usage and may incur charges depending on your authentication
+and billing. Calls have a configurable `--summary-max-usd` **per-call** limit
+(default $2; not a guaranteed total cost cap). It also refuses jobs
+requiring more than `--summary-max-calls 16` model calls by default; raising
+that limit is an explicit opt-in. Responses must contain valid [Tnnnn] citations
+from their source segment; otherwise the importer stops rather than inserting
+unsupported history. No Anthropic access is used in default `index` mode.
+
+To avoid very large model prompts, the history is split chronologically into
+bounded chunks, each summarized separately. If necessary, the resulting summaries
+are merged hierarchically. The model is instructed to distinguish requests,
+implementation, attempted approaches, failures and next steps, with [T0001] style
+source-turn references. Its output is still **AI-generated and fallible**;
+review before trusting technical decisions. Claude failures fail the import
+rather than silently losing source context. Chunk and consolidation summaries
+are cached locally under `~/.claude/codex-import-summaries/` by exact content,
+model and prompt version.
+
+A dry-run of `--summary-mode claude` uses the offline digest as a **preview
+placeholder**; it makes no billable calls and the final size may differ.
+`--summary-tokens` reserves an *estimated* portion of the working context for
+the summary, while retaining the most recent complete conversation turns.
+The original rollouts remain untouched.
+
+You can also supply a manually reviewed summary, avoiding additional model calls:
+
+```powershell
+python3 src/codex_import.py import --session 01a1ab29 --mode faithful --context-budget 400000 --summary-file .\history-notes.txt --force --dry-run
+```
+
+If you've already continued the Claude import, use `--force` to create a new
+session rather than `--replace`; replacement deliberately refuses to overwrite
+native Claude work.
+
 ## When a thread moves on in Codex
 
 A thread can be in both apps and keep going in Codex:
