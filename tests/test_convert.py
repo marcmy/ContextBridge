@@ -219,6 +219,99 @@ def jsonl(recs):
     return ("\n".join(json.dumps(r) for r in recs) + "\n").encode()
 
 
+class TestCodexDiscovery(unittest.TestCase):
+    """Thread/revert lineage and internal Codex sessions must not pollute /resume."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp_obj = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_obj.cleanup)
+        self.tmp = Path(self.tmp_obj.name)
+
+    def make_rollout(self, date, thread_id, *, rollout_id=None, source="cli",
+                     base=None, user="Sample real prompt", assistant="Done"):
+        name = f"rollout-{date}-{thread_id}"
+        if rollout_id:
+            name += f"_{rollout_id}"
+        path = self.tmp / (name + ".jsonl")
+        meta = {"id": thread_id, "timestamp": date.replace("T", "T").replace(
+                "T00-", "T00:").replace("-00-", ":00:"), "cwd": "/test",
+                "source": source}
+        if base:
+            meta["history_base"] = base
+        rows = [{"type": "session_meta", "payload": meta}]
+        if user:
+            rows.append(ri({"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": user}]}))
+        if assistant:
+            rows.append(ri({"type": "message", "role": "assistant",
+                            "content": [{"type": "output_text", "text": assistant}]}))
+        path.write_bytes(jsonl(rows))
+        return path
+
+    def test_latest_revision_keeps_only_retained_ancestor_prefix(self):
+        tid = "01a1ab29-4f15-7150-ac01-306e71950872"
+        rev = "01a1ab2a-6170-77c3-a956-655e435eed77"
+        first = self.make_rollout("2026-11-05T05-02-58", tid, user="Original user prompt")
+        data = first.read_bytes()
+        # Drop the original assistant turn after a revert, keeping user+header.
+        cutoff = len(jsonl([json.loads(line) for line in data.splitlines()[:2]]))
+        self.make_rollout("2026-11-05T05-04-03", tid, rollout_id=rev,
+                          base={"thread_id": tid, "end_byte_offset": cutoff,
+                                "end_ordinal_exclusive": 2},
+                          user="Revised real prompt", assistant="New answer")
+        available = ci.discover(self.tmp)
+        self.assertEqual(len(available), 1)
+        self.assertEqual(available[0]["revisions"], 2)
+        self.assertEqual(available[0]["rollout_id"], rev)
+        rows = ci.read_lineage(available[0])
+        messages = [(r.get("payload") or {}).get("content") for r in rows
+                    if r.get("type") == "response_item"]
+        texts = [ci.text_of(m) for m in messages]
+        self.assertEqual(texts, ["Original user prompt", "Revised real prompt", "New answer"])
+
+    def test_missing_ancestor_never_silently_imports_partial_history(self):
+        tid = "01a1ab29-4f15-7150-ac01-306e71950872"
+        missing = "01a1ab2a-6170-77c3-a956-655e435eed77"
+        self.make_rollout("2026-11-05T05-04-03", tid,
+                          base={"thread_id": missing, "end_byte_offset": 10,
+                                "end_ordinal_exclusive": 1})
+        sess = ci.discover(self.tmp)[0]
+        self.assertIn("missing", sess["lineage_error"])
+        with self.assertRaises(ValueError):
+            ci.read_lineage(sess)
+
+    def test_subagents_and_guardian_are_excluded_by_default(self):
+        ids = [
+            "01a1ab29-4f15-7150-ac01-306e71950872",
+            "01a1ab2a-6170-77c3-a956-655e435eed77",
+            "01a1ab2b-2a5b-7dd1-a5a6-2afe01cb0c59",
+        ]
+        self.make_rollout("2026-11-05T05-02-58", ids[0])
+        self.make_rollout("2026-11-05T05-04-03", ids[1],
+                          source={"subagent": {"thread_spawn": {"parent_thread_id": ids[0]}}})
+        self.make_rollout("2026-11-05T05-04-55", ids[2],
+                          source={"internal": "guardian"})
+        self.assertEqual(len(ci.discover(self.tmp)), 1)
+        self.assertEqual(len(ci.discover(self.tmp, include_internal=True)), 3)
+
+    def test_generated_user_messages_do_not_become_human_prompts(self):
+        for prompt in (
+            '<external_codex_apps_open_page>{"page_id":null}</external_codex_apps_open_page>',
+            "The following is the Codex agent history added since your last approval assessment."
+        ):
+            with self.subTest(prompt=prompt):
+                bg, human = ci.split_user_message(prompt)
+                self.assertTrue(bg)
+                self.assertEqual(human, "")
+                self.assertEqual(ci.clean_title(prompt), "")
+                conv, _ = convert([
+                    ri({"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": prompt}]})
+                ])
+                self.assertFalse(ci.has_conversation(conv.stats))
+
+
 class TestSync(unittest.TestCase):
     """A thread that moved on in Codex after it reached Claude."""
 
