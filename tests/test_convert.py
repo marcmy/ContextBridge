@@ -349,7 +349,7 @@ class TestContextBudget(unittest.TestCase):
         self.assertIn("Implement feature 23; read its tests", human)
         self.assertNotIn("Implement feature 0; read its tests", human)
         self.assertEqual(len(original), 96)
-        self.assertTrue(any("earlier Codex turns" in str((r.get("message") or {}).get("content", ""))
+        self.assertTrue(any("earlier codex turns" in str((r.get("message") or {}).get("content", "")).lower()
                             for r in tail if r.get("isMeta")))
         # The source converter transcript is NOT modified.
         self.assertEqual(len(original[2]["message"]["content"][0]["content"]), 15000)
