@@ -466,6 +466,45 @@ class TestBoundedReimportIntegration(unittest.TestCase):
         self.assertEqual(ci.validate(chain), [])
         self.assertEqual(len({r["sessionId"] for r in chain}), 1)
 
+    def test_ai_summary_not_called_in_dry_run_and_replacement_preflight(self):
+        import contextlib, io
+        from unittest.mock import patch
+
+        def run(**kw):
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                ci.cmd_import(self.options(**kw))
+            return log.getvalue()
+
+        run()
+        entry = ci.load_ledger()[self.tid]
+        target = Path(entry["transcript"])
+        original = target.read_bytes()
+        summary = ("AI-GENERATED CODEX HISTORY SUMMARY. Implemented changes and "
+                   "verified tests [T0001].")
+        with patch.object(ci, "claude_summary",
+                          return_value=(summary, {"calls": 1, "cache_hits": 0})) as mock_ai:
+            output = run(replace=True, context_budget=12000,
+                         summary_mode="claude", dry_run=True)
+            mock_ai.assert_not_called()
+            self.assertIn("Claude AI calls skipped", output)
+            self.assertEqual(target.read_bytes(), original)
+
+            output = run(replace=True, context_budget=12000, summary_mode="claude")
+            self.assertEqual(mock_ai.call_count, 1)
+            self.assertIn("historical summary: claude", output)
+            self.assertIn("AI-GENERATED", target.read_text())
+
+            # Claude has since continued this session, so a future attempt
+            # must abort BEFORE issuing any additional billable model call.
+            with target.open("a") as file:
+                file.write(json.dumps({"type": "assistant",
+                                       "message": {"model": "claude-opus-4-8"}}) + "\\n")
+            before = target.read_bytes()
+            with self.assertRaisesRegex(SystemExit, "Claude has continued"):
+                run(replace=True, context_budget=12000, summary_mode="claude")
+            self.assertEqual(target.read_bytes(), before)
+            self.assertEqual(mock_ai.call_count, 1)
+
 
 class TestSafeReplace(unittest.TestCase):
     def setUp(self):
