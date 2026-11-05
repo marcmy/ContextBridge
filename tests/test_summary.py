@@ -119,6 +119,29 @@ class TestClaudeSummaries(unittest.TestCase):
             self.assertEqual(stats2["calls"], 0)
             self.assertGreater(stats2["cache_hits"], 0)
 
+    def test_rejects_invented_or_missing_source_citations(self):
+        for fake in ("Claims without any citations",
+                     "Implemented feature [T9999]"):
+            with self.subTest(fake=fake), tempfile.TemporaryDirectory() as d:
+                def run(cmd, **kwargs):
+                    return SimpleNamespace(returncode=0, stderr="",
+                                           stdout=json.dumps({"result": fake}))
+                with self.assertRaisesRegex(RuntimeError, "citations"):
+                    hs.claude_summary(hs.evidence_turns(history(4)),
+                                      cache_dir=Path(d), runner=run)
+                self.assertEqual(list(Path(d).rglob("*.json")), [])
+
+    def test_max_calls_refuses_before_model_invocation(self):
+        calls = []
+        def run(cmd, **kwargs):
+            calls.append(cmd)
+            raise AssertionError("should never invoke Claude")
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaisesRegex(ValueError, "requires up to"):
+                hs.claude_summary(hs.evidence_turns(history(320)), max_calls=1,
+                                  cache_dir=Path(d), runner=run)
+            self.assertEqual(calls, [])
+
     def test_cache_does_not_hide_model_failure(self):
         def run(cmd, **kwargs):
             return SimpleNamespace(returncode=0, stdout='{"is_error":true,"result":""}', stderr="")
