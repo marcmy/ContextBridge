@@ -345,7 +345,11 @@ class HandoffEngine:
             return [none, cont]
         if state is SyncState.BOTH_ADVANCED:
             cont.recommended = True
-            return [cont, none]
+            update = StrategyOption(
+                "delta_refresh", "Merge into the existing Codex thread", "", enabled=False,
+                caution="Unavailable: Codex's importer won't add to a thread that has its own new "
+                        "work. To merge the other way, open the Codex thread and use Send to Claude.")
+            return [cont, update]
         # Modified source or ambiguous lineage: positions can't be trusted.
         full.label = "Create a new Codex thread from the current session"
         full.caution = "Earlier checkpoints can't be trusted, so everything is included."
