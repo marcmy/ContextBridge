@@ -17,7 +17,7 @@ from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
 
-import codex_import as ci
+from . import converter
 
 from . import scan
 from .discovery import Discovery
@@ -65,7 +65,7 @@ class Lineage:
                 codex_id=tid, claude_id=sid, direction="codex->claude",
                 relation="round-trip" if entry.get("kind") == "round-trip" else "import",
                 origin="claude-ledger", when=when,
-                codex_pos=(ci.normalize_path(entry.get("sourceRollout")),
+                codex_pos=(converter.normalize_path(entry.get("sourceRollout")),
                            entry.get("sourceBytes"), entry.get("sourceSha256")),
                 claude_path=target, bounded=bool(entry.get("contextBudget")),
                 meta={k: entry.get(k) for k in ("mode", "contextBudget", "summaryMode")},
@@ -87,7 +87,7 @@ class Lineage:
                 id=None, src_provider=CODEX, src_id=tid, dst_provider=CLAUDE, dst_id=path.stem,
                 relation="import", origin="transcript-marker",
                 transferred_at=prov.get("syncedAt") or prov.get("importedAt") or now_iso(),
-                src_path=ci.normalize_path(prov.get("codexRollout")),
+                src_path=converter.normalize_path(prov.get("codexRollout")),
                 src_sha=prov.get("codexRolloutSha256"), dst_path=str(path),
                 dst_offset=info.get("mark_end")))
 
@@ -96,7 +96,7 @@ class Lineage:
         delta_stems = {Path(l.delta_path).stem for l in self.store.links() if l.delta_path}
         for rec in data.get("records", []) if isinstance(data, dict) else []:
             thread = rec.get("imported_thread_id")
-            source = ci.normalize_path(rec.get("source_path"))
+            source = converter.normalize_path(rec.get("source_path"))
             if not thread or not source:
                 continue
             stem = Path(source).stem
@@ -272,12 +272,12 @@ class Lineage:
                 continue
             if payload.get("type") == "message":
                 if payload.get("role") == "user":
-                    if ci.split_user_message(ci.text_of(payload.get("content")))[1]:
+                    if converter.split_user_message(converter.text_of(payload.get("content")))[1]:
                         human += 1
                 elif payload.get("role") == "assistant":
                     assistant += 1
                 last = rec.get("timestamp") or last
-            elif payload.get("type") in ci.CONTENT_TYPES:
+            elif payload.get("type") in converter.CONTENT_TYPES:
                 last = rec.get("timestamp") or last
         return Delta(human=human, assistant=assistant, last_ts=last)
 
@@ -334,7 +334,7 @@ class Lineage:
             return verdict(SyncState.BOTH_ADVANCED,
                            f"Both agents moved on since the last common checkpoint "
                            f"({local.human} new turn(s) here, {remote.human} in {name}). "
-                           "They will not be merged; a separate continuation session is offered.")
+                           "A separate continuation session is recommended; nothing merges unless you choose it.")
         if local.advanced:
             return verdict(SyncState.SOURCE_ADVANCED,
                            f"{local.human} new human turn(s) and {local.assistant} assistant "
@@ -492,13 +492,13 @@ def codex_records_after(raw: dict, path: str, offset: int | None, sha: str | Non
     chain = raw.get("lineage") or [(raw["path"], None)]
     if offset is None:
         return [], ""
-    index = next((i for i, (p, _) in enumerate(chain) if ci.same_rollout(p, path)), None)
+    index = next((i for i, (p, _) in enumerate(chain) if converter.same_rollout(p, path)), None)
     if index is None:
         return [], (f"the thread's current history no longer includes the transferred "
-                    f"rollout {Path(ci.uncompressed_name(path)).name}")
+                    f"rollout {Path(converter.uncompressed_name(path)).name}")
     records: list[tuple[int, dict]] = []
     for i, (rollout, cutoff) in enumerate(chain[index:]):
-        data = ci.rollout_bytes(rollout)
+        data = converter.rollout_bytes(rollout)
         if i == 0:
             if offset > len(data):
                 return [], "rollout is shorter than the recorded checkpoint"
@@ -513,7 +513,7 @@ def codex_records_after(raw: dict, path: str, offset: int | None, sha: str | Non
             start = 0
         if cutoff is not None:
             data = data[:cutoff]
-        records.extend(ci.records_from(data, start))
+        records.extend(converter.records_from(data, start))
     return records, ""
 
 
@@ -525,7 +525,7 @@ def _offset_of_sha(path: Path, digest: str | None) -> int | None:
         data = path.read_bytes()
     except OSError:
         return None
-    return ci.prefix_offset(data, digest)
+    return converter.prefix_offset(data, digest)
 
 
 def _epoch_iso(seconds) -> str:

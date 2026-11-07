@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import CLAUDE, CODEX, SandboxCase, ci  # noqa: E402
+from helpers import CLAUDE, CODEX, SandboxCase, converter  # noqa: E402
 from contextbridge.codex_bridge import CodexBridge  # noqa: E402
 from contextbridge.models import SyncState  # noqa: E402
 
@@ -113,7 +113,7 @@ class TestRealImporter(SandboxCase):
         self.assertEqual(box.claude_humans(b), ["A1 start the work", "B1 claude continues", "C1 codex resumes"])
         self.assertEqual(box.rollout_path(a).read_bytes(), rollout_a)
         self.assertEqual(self.get("codex", c).state, SyncState.UNCHANGED)
-        self.assertEqual(ci.validate([json.loads(line) for line in box.find_claude(b).read_bytes().splitlines()
+        self.assertEqual(converter.validate([json.loads(line) for line in box.find_claude(b).read_bytes().splitlines()
                                       if json.loads(line).get("type") in ("user", "assistant")]), [])
 
 

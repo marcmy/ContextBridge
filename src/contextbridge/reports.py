@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-import codex_import as ci
+from . import converter
 
 
 @dataclass
@@ -118,7 +118,7 @@ def write_report(directory: Path, report: HandoffReport) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     base = directory / f"{stamp}-{report.transfer_id[:8]}"
     report.report_path = str(base.with_suffix(".md"))
-    ci.atomic_write_bytes(base.with_suffix(".json"),
+    converter.atomic_write_bytes(base.with_suffix(".json"),
                           json.dumps(report.to_dict(), indent=2, ensure_ascii=False).encode("utf-8"))
-    ci.atomic_write_bytes(base.with_suffix(".md"), report.to_markdown().encode("utf-8"))
+    converter.atomic_write_bytes(base.with_suffix(".md"), report.to_markdown().encode("utf-8"))
     return base.with_suffix(".md")

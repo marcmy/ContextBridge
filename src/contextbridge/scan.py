@@ -8,16 +8,16 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-import codex_import as ci
+from . import converter
 
 # Bump when scan output changes, so cached results are recomputed.
 SCANNER_VERSION = 3
 
 _SKIP_TYPES = (b'"type":"api-request', b'"type": "api-request')
 _FINGERPRINT_TURNS = 5
-SYNTHETIC_MODELS = ci.SYNTHETIC_MODELS
-_NOT_HUMAN = ci.NOT_HUMAN_PREFIXES
-human_text = ci.human_text
+SYNTHETIC_MODELS = converter.SYNTHETIC_MODELS
+_NOT_HUMAN = converter.NOT_HUMAN_PREFIXES
+human_text = converter.human_text
 
 
 def _normal(text: str) -> str:
@@ -76,7 +76,7 @@ def scan_claude(path: Path, start: int = 0, since_ts: str = "") -> dict:
         if kind == "custom-title":
             if rec.get("customTitle"):
                 info["custom_title"] = rec["customTitle"]
-            if rec.get("importedFrom") == ci.IMPORT_MARK:
+            if rec.get("importedFrom") == converter.IMPORT_MARK:
                 info["mark_end"] = pos
                 info["native_after_mark"] = 0
                 prov = {k: rec.get(k) for k in ("codexThreadId", "codexRollout",
@@ -110,7 +110,7 @@ def scan_claude(path: Path, start: int = 0, since_ts: str = "") -> dict:
                     open_tools.discard(block.get("tool_use_id", ""))
         if model is not None:
             if model in SYNTHETIC_MODELS:
-                info["imported_assistant"] += int(model == ci.IMPORT_MODEL)
+                info["imported_assistant"] += int(model == converter.IMPORT_MODEL)
             else:
                 info["native_assistant"] += 1
                 info["native_after_mark"] += 1
@@ -125,7 +125,7 @@ def scan_claude(path: Path, start: int = 0, since_ts: str = "") -> dict:
             info["first_human"] = info["first_human"] or said
             # A converted turn in a sync is not native work either, but those carry
             # their assistant replies with the import model, so only count real ones.
-            if not ci.is_converter_record(rec):
+            if not converter.is_converter_record(rec):
                 info["native_after_mark"] += 1
                 info["native_chain"] += 1
                 info["native_human"] += 1
@@ -141,7 +141,7 @@ def scan_rollout_bytes(data: bytes, start: int = 0) -> dict:
             "end": start, "fingerprint": "", "first_human": "", "prompts": []}
     prompts: list[str] = info["prompts"]
     open_turns: set[str] = set()
-    for off, rec in ci.records_from(data, start):
+    for off, rec in converter.records_from(data, start):
         info["end"] = off
         kind = rec.get("type")
         payload = rec.get("payload") or {}
@@ -154,19 +154,19 @@ def scan_rollout_bytes(data: bytes, start: int = 0) -> dict:
                 open_turns.add(turn)
             elif ptype in ("task_complete", "turn_aborted"):
                 open_turns.discard(turn)
-                if ptype == "task_complete" and turn.startswith(ci.EXTERNAL_TURN_PREFIX):
+                if ptype == "task_complete" and turn.startswith(converter.EXTERNAL_TURN_PREFIX):
                     info["import_end"] = off
                     info["human_after_import"] = 0
                     info["assistant_after_import"] = 0
             continue
-        if kind != "response_item" or ptype not in ci.CONTENT_TYPES:
+        if kind != "response_item" or ptype not in converter.CONTENT_TYPES:
             continue
         ts = rec.get("timestamp") or ""
         if ts:
             info["first_ts"] = info["first_ts"] or ts
             info["last_ts"] = ts
         if ptype == "message" and payload.get("role") == "user":
-            human = ci.split_user_message(ci.text_of(payload.get("content")))[1]
+            human = converter.split_user_message(converter.text_of(payload.get("content")))[1]
             if human and not human.lstrip().startswith(_NOT_HUMAN):
                 info["human"] += 1
                 info["human_after_import"] += 1

@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import CLAUDE, CODEX, Sandbox, SandboxCase, ci  # noqa: E402
+from helpers import CLAUDE, CODEX, Sandbox, SandboxCase, converter  # noqa: E402
 from contextbridge import handoff as handoff_module  # noqa: E402
 from contextbridge.handoff import HandoffError, HandoffOptions  # noqa: E402
 from contextbridge.models import SyncState  # noqa: E402
@@ -78,7 +78,7 @@ class TestDiscovery(SandboxCase):
 
     def test_compressed_rollouts_read_like_plain_ones(self):
         try:
-            zstd = ci._zstd()
+            zstd = converter._zstd()
             compress = zstd.compress
         except (RuntimeError, AttributeError):
             self.skipTest("no zstd codec")
@@ -106,13 +106,13 @@ class TestDiscovery(SandboxCase):
         self.assertFalse(snap.duplicates)  # fewer than 3 turns of overlap is not even "possible"
 
     def test_windows_paths_are_normalized(self):
-        self.assertEqual(ci.normalize_path("\\\\?\\C:\\Users\\m\\x.jsonl"), "C:\\Users\\m\\x.jsonl")
-        self.assertEqual(ci.normalize_path("\\\\?\\UNC\\srv\\s\\x"), "\\\\srv\\s\\x")
-        self.assertEqual(ci.slug_for("C:\\Users\\m\\src\\Repo"), "C--Users-m-src-Repo")
-        self.assertEqual(ci.group_scratch("C:\\Users\\m\\Documents\\Codex\\2026-09-13\\some-slug"),
+        self.assertEqual(converter.normalize_path("\\\\?\\C:\\Users\\m\\x.jsonl"), "C:\\Users\\m\\x.jsonl")
+        self.assertEqual(converter.normalize_path("\\\\?\\UNC\\srv\\s\\x"), "\\\\srv\\s\\x")
+        self.assertEqual(converter.slug_for("C:\\Users\\m\\src\\Repo"), "C--Users-m-src-Repo")
+        self.assertEqual(converter.group_scratch("C:\\Users\\m\\Documents\\Codex\\2026-09-13\\some-slug"),
                          "C:\\Users\\m\\Documents\\Codex")
-        self.assertEqual(ci.group_scratch("C:\\Users\\m\\src\\Repo"), "C:\\Users\\m\\src\\Repo")
-        self.assertTrue(ci.same_rollout("\\\\?\\C:\\a\\r.jsonl", "C:\\a\\r.jsonl.zst"))
+        self.assertEqual(converter.group_scratch("C:\\Users\\m\\src\\Repo"), "C:\\Users\\m\\src\\Repo")
+        self.assertTrue(converter.same_rollout("\\\\?\\C:\\a\\r.jsonl", "C:\\a\\r.jsonl.zst"))
 
 
 class TestCodexToClaude(SandboxCase):
@@ -125,7 +125,7 @@ class TestCodexToClaude(SandboxCase):
     def test_preview_writes_nothing(self):
         session = self.get("codex", self.thread)
         before = _tree(self.box.claude_home), _tree(self.box.codex_home)
-        with patch.object(ci, "claude_summary", side_effect=AssertionError("billable call")):
+        with patch.object(converter, "claude_summary", side_effect=AssertionError("billable call")):
             plan = self.app.plan(session, CLAUDE, HandoffOptions(summary_mode="claude",
                                                                  context_budget=20000))
         self.assertEqual(plan.strategy, "new_session")
@@ -171,7 +171,7 @@ class TestCodexToClaude(SandboxCase):
         self.assertEqual(self.get("claude", report.dest_id).state, SyncState.SOURCE_ADVANCED)
         self.assertFalse(self.app.can_archive(self.get("claude", report.dest_id))[0])
 
-    def test_both_advanced_never_merges(self):
+    def test_both_advanced_does_not_merge_by_default(self):
         report = self.send("codex", self.thread, CLAUDE)
         original = self.box.find_claude(report.dest_id)
         self.box.claude_turn(report.dest_id, "claude branch work", "claude answer")
@@ -280,7 +280,7 @@ class TestCodexToClaude(SandboxCase):
 
     def test_crash_during_write_is_flagged_on_next_start(self):
         plan = self.app.plan(self.get("codex", self.thread), CLAUDE, self.options())
-        with patch.object(ci, "write_import", side_effect=KeyboardInterrupt):
+        with patch.object(converter, "write_import", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 self.app.execute(plan)
         snap = self.refresh()
@@ -308,7 +308,7 @@ class TestCodexToClaude(SandboxCase):
         self.assertTrue(any("authorization" in w for w in plan.warnings))
         with self.assertRaisesRegex(HandoffError, "not authorized"):
             self.app.execute(plan)
-        with patch.object(ci, "claude_summary", return_value=("[T0001] grounded", {"calls": 2, "cache_hits": 0})) as call:
+        with patch.object(converter, "claude_summary", return_value=("[T0001] grounded", {"calls": 2, "cache_hits": 0})) as call:
             opts.summary_authorized = True
             report = self.app.execute(self.app.plan(self.get("codex", self.thread), CLAUDE, opts))
         self.assertEqual(call.call_count, 1)
@@ -324,7 +324,7 @@ class TestCodexToClaude(SandboxCase):
         text = self.box.find_claude(report.dest_id).read_text(encoding="utf-8")
         self.assertIn("OFFLINE HISTORICAL EVIDENCE INDEX", text)
         self.assertIn("NOT an AI summary", text)
-        self.assertEqual(ci.validate([json.loads(x) for x in text.splitlines()
+        self.assertEqual(converter.validate([json.loads(x) for x in text.splitlines()
                                       if json.loads(x).get("type") in ("user", "assistant")]), [])
 
     def test_replace_refused_after_claude_continues(self):
@@ -665,10 +665,10 @@ class TestDuplicates(SandboxCase):
         ledger_sid = "11111111-2222-4333-8444-555555555555"
         path = self.box.claude_path(ledger_sid)
         path.parent.mkdir(parents=True)
-        conv = ci.Converter({"id": guardian}, "archive", False, "2", str(self.box.project),
+        conv = converter.Converter({"id": guardian}, "archive", False, "2", str(self.box.project),
                             session_id=ledger_sid)
         out = conv.run([self.box.ev_user("pretend review note here"), self.box.ev_assistant("ok")])
-        path.write_bytes(ci.jsonl_bytes([json.dumps(r) for r in out]))
+        path.write_bytes(converter.jsonl_bytes([json.dumps(r) for r in out]))
         self.box.claude_ledger.write_text(json.dumps({guardian: {
             "claudeSessionId": ledger_sid, "transcript": str(path), "kind": "import",
             "importedAt": "2026-11-01T00:00:00+00:00", "sourceRollout": str(self.box.rollout_path(guardian)),
@@ -707,18 +707,19 @@ class TestCleanup(SandboxCase):
 
 
 class TestLedgerReconciliation(SandboxCase):
-    def test_existing_cli_import_is_understood(self):
-        """A transfer made earlier by `codex_import.py` shows up with its checkpoints."""
+    def test_import_already_in_the_ledger_is_understood(self):
+        """An import recorded before ContextBridge first ran shows up with its checkpoints."""
         thread = self.box.codex_rollout()
-        self.box.codex_turn(thread, "from the old tool", "answer")
+        self.box.codex_turn(thread, "imported earlier", "answer")
         args = self.options().as_args(self.box.claude_home / "projects", dry_run=False)
-        s = ci.discover(self.box.codex_home / "sessions")[0]
-        built = ci.build_import(s, args, "2.1.300")
-        target = self.box.claude_home / "projects" / ci.slug_for(built["cwd"]) / f"{built['conv'].session_id}.jsonl"
-        ci.write_import(target, built["lines"])
-        ci.save_ledger({thread: ci.ledger_entry(s, built, target, None, args)})
+        s = converter.summarize(self.box.rollout_path(thread))
+        converter.resolve_lineage(s, {})
+        built = converter.build_import(s, args, "2.1.300")
+        target = self.box.claude_home / "projects" / converter.slug_for(built["cwd"]) / f"{built['conv'].session_id}.jsonl"
+        converter.write_import(target, built["lines"])
+        converter.save_ledger({thread: converter.ledger_entry(s, built, target, None, args)})
         self.assertEqual(self.get("codex", thread).state, SyncState.UNCHANGED)
-        self.box.codex_turn(thread, "newer than the old tool", "answer")
+        self.box.codex_turn(thread, "newer than the import", "answer")
         self.assertEqual(self.get("codex", thread).state, SyncState.SOURCE_ADVANCED)
 
     def test_codex_ledger_is_read_with_extended_paths(self):
@@ -738,11 +739,11 @@ class TestLedgerReconciliation(SandboxCase):
         self.assertEqual(self.box.codex_ledger.read_bytes(), before)
         self.assertFalse(self.box.claude_ledger.exists())
 
-    def test_cli_status_still_works_on_contextbridge_imports(self):
+    def test_transfer_is_recorded_in_the_claude_ledger(self):
         thread = self.box.codex_rollout()
-        self.box.codex_turn(thread, "still compatible", "answer")
+        self.box.codex_turn(thread, "recorded in the ledger", "answer")
         self.send("codex", thread, CLAUDE)
-        ledger = ci.load_ledger()
+        ledger = converter.load_ledger()
         self.assertEqual(ledger[thread]["kind"], "import")
         self.assertEqual(ledger[thread]["sourceBytes"], self.box.rollout_path(thread).stat().st_size)
 
@@ -790,7 +791,7 @@ def _tree(root: Path) -> dict:
 
 
 def _offset_after_first_turn(path: Path) -> int:
-    for off, rec in ci.records_from(path.read_bytes()):
+    for off, rec in converter.records_from(path.read_bytes()):
         if (rec.get("payload") or {}).get("type") == "task_complete":
             return off
     raise AssertionError

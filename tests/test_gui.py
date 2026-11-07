@@ -167,7 +167,7 @@ class TestHandoffDialog(GuiCase):
         self.assertEqual(dialog.plan.strategy, "none")
         self.assertFalse(dialog.next_button.isEnabled())
 
-    def test_both_advanced_offers_only_a_continuation(self):
+    def test_both_advanced_recommends_a_continuation(self):
         thread = self.box.codex_rollout()
         self.box.codex_turn(thread, "Refactor the renderer", "done")
         dest = self.send("codex", thread, CLAUDE).dest_id
@@ -178,6 +178,11 @@ class TestHandoffDialog(GuiCase):
         radios = {r.property("strategy"): r for r in dialog.findChildren(QRadioButton)}
         self.assertFalse(radios["append"].isEnabled())
         self.assertTrue(radios["continuation"].isChecked())
+        self.assertTrue(radios["merge"].isEnabled())
+        self.assertFalse(radios["merge"].isChecked())
+        radios["merge"].setChecked(True)
+        pump(lambda: dialog.plan.strategy == "merge" and not dialog._busy)
+        self.assertTrue(any("merges two diverged" in w for w in dialog.plan.warnings))
 
     def test_changing_the_budget_recalculates_the_preview(self):
         thread = self.box.codex_rollout()
@@ -263,6 +268,108 @@ class TestManagePage(GuiCase):
                 break
         self.assertFalse(page.archive_button.isEnabled())
         self.assertEqual(page.duplicate_table.item(page.duplicate_table.currentRow(), 4).text(), "Protected")
+
+
+class TestMaintenancePages(GuiCase):
+    def test_import_health_finds_and_removes_an_import(self):
+        box = self.box
+        thread = box.codex_rollout()
+        box.codex_turn(thread, "a request worth keeping", "answer")
+        sid = self.send("codex", thread, CLAUDE).dest_id
+        path = box.find_claude(sid)
+        stamp = path.stat().st_mtime - 3600
+        os.utime(path, (stamp, stamp))
+        win = self.window()
+        page = win.manage
+        page.tabs.setCurrentWidget(page.imports)
+        pump(lambda: page.imports.table.rowCount() == 1)
+        self.assertEqual(page.imports.table.item(0, 4).text(), "Intact")
+        self.assertIn("1 intact", page.imports.summary.text())
+        page.imports.table.selectRow(0)
+        self.assertTrue(page.imports.remove_button.isEnabled())
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes), \
+                patch.object(QMessageBox, "information", return_value=QMessageBox.Ok) as told:
+            page.imports._remove()
+            pump(lambda: not path.exists())
+            pump(lambda: told.called)
+            self.wait_refreshed(win)
+            pump(lambda: page.archive_table.rowCount() == 1)
+
+    def test_bulk_import_through_the_page(self):
+        box = self.box
+        thread = box.codex_rollout()
+        box.codex_turn(thread, "first thread", "answer")
+        other = box.codex_rollout()
+        box.codex_turn(other, "second thread", "answer")
+        win = self.window()
+        panel = win.manage.bulk
+        self.assertEqual(panel.table.rowCount(), 2)
+        panel.table.item(1, 0).setCheckState(Qt.Unchecked)
+        panel.budget.setCurrentIndex(panel.budget.findData(None))
+        panel.prefix.setText("[codex] ")
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes), \
+                patch.object(QMessageBox, "information", return_value=QMessageBox.Ok) as told:
+            panel._start()
+            pump(lambda: told.called)
+            self.wait_refreshed(win)
+        self.assertIn("Imported: 1 of 1", told.call_args[0][2])
+        written = list(box.claude_home.glob("projects/*/*.jsonl"))
+        self.assertEqual(len(written), 1)
+        self.assertIn("[codex] ", written[0].read_text(encoding="utf-8"))
+        pump(lambda: panel.table.rowCount() == 1)
+
+    def test_desktop_page_clears_rows_and_copies_between_accounts(self):
+        box = self.box
+        keep = box.claude_session(("a session to keep", "ok"))
+        other = box.claude_session(("in the new account", "ok"))
+        dead = box.desktop_card("old", "work", "gone-session", title="Dead row")
+        box.desktop_card("old", "work", keep, title="Live row")
+        box.desktop_card("new", "work", other)
+        box.set_active_account("new")
+        win = self.window()
+        page = win.manage
+        panel = page.desktop
+        page.tabs.setCurrentWidget(panel)
+        pump(lambda: panel.dead_table.rowCount() == 1)
+        self.assertEqual(panel.dead_table.item(0, 0).text(), "Dead row")
+        self.assertEqual(panel.source.currentData().parent.name, "old")
+        self.assertEqual(panel.destination.currentData().parent.name, "new")
+        self.assertTrue(panel.move_button.isEnabled())
+        new_reg = panel.destination.currentData()
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.Yes), \
+                patch.object(QMessageBox, "information", return_value=QMessageBox.Ok):
+            panel._clear()
+            pump(lambda: not dead.exists())
+            self.wait_refreshed(win)
+            pump(lambda: panel.dead_table.rowCount() == 0 and panel.refresh_button.isEnabled())
+            panel._move()
+            pump(lambda: len(list(new_reg.glob("local_*.json"))) == 2)
+            self.wait_refreshed(win)
+            pump(lambda: panel.refresh_button.isEnabled())
+
+    def test_dialog_carries_the_conversion_options(self):
+        box = self.box
+        thread = box.codex_rollout()
+        box.codex_turn(thread, "a request", "answer")
+        win = self.window()
+        session = next(s for s in win.snapshot.sessions if s.session_id == thread)
+        dialog = HandoffDialog(self.app, session, CLAUDE, win)
+        self.addCleanup(dialog.deleteLater)
+        pump(lambda: dialog.plan is not None)
+        dialog.title_prefix.setText("[codex] ")
+        dialog.include_banner.setChecked(False)
+        dialog.group_scratch.setChecked(False)
+        self.assertFalse(dialog.summary_file.isVisibleTo(dialog.summary_file.parentWidget()))
+        dialog.summary_mode.setCurrentIndex(dialog.summary_mode.findData("file"))
+        self.assertTrue(dialog.summary_file.isVisibleTo(dialog.summary_file.parentWidget()))
+        dialog.summary_file.setText("notes.txt")
+        options = dialog._read_form()
+        self.assertEqual(options.title_prefix, "[codex] ")
+        self.assertFalse(options.include_banner)
+        self.assertFalse(options.group_scratch)
+        self.assertEqual((options.summary_mode, options.summary_file), ("file", "notes.txt"))
+        dialog.summary_mode.setCurrentIndex(dialog.summary_mode.findData("index"))
+        pump(lambda: not dialog._busy)
 
 
 if __name__ == "__main__":
