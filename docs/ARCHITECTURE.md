@@ -24,8 +24,7 @@ Native records are inputs. On every refresh, links are reconciled from:
 | `~/.codex/external_agent_session_imports.json` | Which Claude transcript Codex imported, with a whole-file hash |
 | `~/.codex/state_5.sqlite` (read-only) | Each thread's current rollout, title and archived flag |
 
-ContextBridge updates `codex-imports.json` when it transfers, as the importer always has, and
-keeps a dated copy first. It does not write to Codex's ledger or database; only Codex does, during
+ContextBridge updates `codex-imports.json` when it transfers, and keeps a dated copy first. It does not write to Codex's ledger or database; only Codex does, during
 an import that Codex itself performs.
 
 ### Rules enforced in code
@@ -33,8 +32,11 @@ an import that Codex itself performs.
 - **No duplicated turns.** Transfers start from a recorded position.
 - **No overwriting.** Appending requires the destination to be unchanged since the preview and
   not running. Replacing requires that the session is our own and Claude never continued it.
-- **No silent merges.** When both sides advanced, appending is disabled and a continuation is
-  offered. The Codex importer's own no-op in this situation is a second line of defence.
+- **No silent merges.** When both sides advanced, a normal append is disabled and a continuation
+  is recommended. A merge is a separate transfer type that must be chosen, and it's never
+  preselected. It leaves Claude's checkpoint where it was, because Claude's turns still haven't
+  reached Codex, and records which bytes it added so they aren't sent back. The Codex importer's
+  own no-op when a thread has native work is a second line of defence.
 - **No identity from similarity.** Only recorded provenance can establish a duplicate. Sessions
   that merely open with the same requests are reported as "possible" and are never offered for
   cleanup. Forks that a provider recorded are not reported at all.
@@ -98,6 +100,10 @@ That thread can be archived later once it is superseded.
 - A newly written file that fails validation is moved aside, not deleted.
 - Imported content is treated as data. No historical tool call is ever executed, and session IDs
   are validated before they reach a resume command.
+- Removing an import, clearing a sidebar row and taking rows out of an old account also only
+  move files to the archive, and the ledger is copied before it changes.
+- Claude Desktop's cards are only used with the real Claude home. With `--claude-home`, the app
+  doesn't read them, so a sandbox can't report real rows as dead.
 - Cleanup only archives. Codex threads use Codex's own archive; Claude transcripts move to
   `~/.contextbridge/archive/`. Both restore. Original sessions, sessions with native work and
   sessions in use can't be archived, and this is enforced in the backend, not just the UI.
@@ -106,7 +112,7 @@ That thread can be archived later once it is superseded.
 
 | What | How it was checked |
 |---|---|
-| Conversion, budgets, summaries | The original regression tests, unchanged |
+| Conversion, budgets, summaries | `tests/test_convert.py` and `tests/test_summary.py` |
 | The proven baseline thread | A dry run on its real rollouts gives 1,177,139 estimated tokens to 383,746, with 212 tool pairs, 498 retained, 144 omitted and 136 shortened. The earlier real import, with its AI summary, was 385,463 |
 | All acceptance scenarios | `tests/test_lineage_scenarios.py`, using a stand-in for the Codex importer |
 | That stand-in's accuracy, and a full round trip | `tests/test_real_codex.py`, on the real `codex` CLI and its real database, in a sandbox. The "native Codex turn" is appended to the rollout by the test, because producing a real one needs a model call |
@@ -125,6 +131,8 @@ None of these have been run against the real applications in normal use:
 - How the Codex app shows a new thread. It may need a relaunch, and the app-server protocol may
   interact with a running Codex app in ways the sandbox can't show.
 - An AI summary started from the dialog. The call path is the proven one, but tests mock it.
+- Clearing rows and moving them between accounts in real Claude Desktop. Both are tested on
+  synthetic cards only, and the app may rewrite cards while it's running.
 - **Also add a row to Claude Desktop's sidebar** on Windows. The registry path is detected, but no
   card was written. Existing cards suggest the app now finds CLI transcripts by itself, in which
   case this option isn't needed.

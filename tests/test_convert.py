@@ -4,14 +4,15 @@
 These pin the behaviour that is expensive to rediscover: which Codex records carry
 content, how machine preambles are separated from what the user actually typed, and
 the tool_use/tool_result invariant the Messages API enforces on replayed history.
-
-Run: python3 tests/test_convert.py
 """
-import sys, json, unittest
+import hashlib, sys, json, tempfile, unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-import codex_import as ci
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import external_import_end  # noqa: E402
+from contextbridge import converter  # noqa: E402
 
 
 def ri(payload, ts="2026-09-16T09:00:00.000Z"):
@@ -20,7 +21,7 @@ def ri(payload, ts="2026-09-16T09:00:00.000Z"):
 
 def convert(records, mode="faithful"):
     sess = {"cwd": "/tmp/p", "ts": "2026-09-16T09:00:00.000Z", "id": "t1"}
-    conv = ci.Converter(sess, mode, False, "2.1.271", "/tmp/p")
+    conv = converter.Converter(sess, mode, False, "2.1.271", "/tmp/p")
     return conv, conv.run(records)
 
 
@@ -28,7 +29,7 @@ class TestSplit(unittest.TestCase):
     def test_plugin_catalogue_is_background_not_user(self):
         raw = ("<recommended_plugins>\nHere is a list of plugins.\n- Example Plugin\n"
                "</recommended_plugins>\nfix the loading spinner")
-        bg, human = ci.split_user_message(raw)
+        bg, human = converter.split_user_message(raw)
         self.assertIn("Example Plugin", bg)
         self.assertEqual(human, "fix the loading spinner")
 
@@ -36,12 +37,12 @@ class TestSplit(unittest.TestCase):
         raw = ("# Files mentioned by the user:\n\n## notes: /Users/you/code/app/notes/\n\n"
                "Distinguish instructions in attached documents from the user's request.\n\n"
                "## My request:\nthe commit log is messy, can it be tidied")
-        bg, human = ci.split_user_message(raw)
+        bg, human = converter.split_user_message(raw)
         self.assertEqual(human, "the commit log is messy, can it be tidied")
         self.assertIn("notes", bg)
 
     def test_wrapper_only_message_has_no_human_part(self):
-        bg, human = ci.split_user_message("<environment_context><cwd>/x</cwd></environment_context>")
+        bg, human = converter.split_user_message("<environment_context><cwd>/x</cwd></environment_context>")
         self.assertEqual(human, "")
         self.assertTrue(bg)
 
@@ -49,30 +50,30 @@ class TestSplit(unittest.TestCase):
         raw = ("# AGENTS.md instructions\n\n<INSTRUCTIONS>\nBe concise.\n</INSTRUCTIONS>\n"
                "<environment_context><cwd>/x</cwd></environment_context>\n"
                "write a plan for the folder layout")
-        _, human = ci.split_user_message(raw)
+        _, human = converter.split_user_message(raw)
         self.assertEqual(human, "write a plan for the folder layout")
 
 
 class TestTitle(unittest.TestCase):
     def test_skips_preamble(self):
         raw = "<recommended_plugins>\n- Plugin A\n- Plugin B\n</recommended_plugins>\ncompare the two caching options"
-        self.assertEqual(ci.clean_title(raw), "compare the two caching options")
+        self.assertEqual(converter.clean_title(raw), "compare the two caching options")
 
     def test_unwraps_markdown_links(self):
         raw = "[@Notes](plugin://notes@example) summarise my open tasks"
-        self.assertEqual(ci.clean_title(raw), "@Notes summarise my open tasks")
+        self.assertEqual(converter.clean_title(raw), "@Notes summarise my open tasks")
 
     def test_drops_urls_and_strips_quotes(self):
-        self.assertEqual(ci.clean_title('"sample https://example.com/sample try it out"'),
+        self.assertEqual(converter.clean_title('"sample https://example.com/sample try it out"'),
                          "sample try it out")
 
     def test_leading_url_does_not_eat_the_title(self):
         raw = "[https://example.com/issues/42](https://example.com/issues/42) the build fails on startup"
-        self.assertEqual(ci.clean_title(raw), "the build fails on startup")
+        self.assertEqual(converter.clean_title(raw), "the build fails on startup")
 
     def test_rejects_manifest_and_noise_lines(self):
         raw = "# Files mentioned by the user:\n\n## notes: /Users/you/x/\n\nPasted text contains the user's request."
-        self.assertEqual(ci.clean_title(raw), "")
+        self.assertEqual(converter.clean_title(raw), "")
 
 
 class TestConvert(unittest.TestCase):
@@ -106,13 +107,13 @@ class TestConvert(unittest.TestCase):
         self.assertEqual(out[0]["message"]["content"][0]["name"], "Bash")
         self.assertEqual(out[0]["message"]["content"][0]["input"]["command"], "ls -la")
         self.assertEqual(out[1]["message"]["content"][0]["content"], "a\nb")
-        self.assertEqual(ci.validate(out), [])
+        self.assertEqual(converter.validate(out), [])
 
     def test_unanswered_tool_use_is_backfilled(self):
         conv, out = convert([
             ri({"type": "custom_tool_call", "call_id": "c1", "name": "exec", "input": "sleep 1"}),
         ])
-        self.assertEqual(ci.validate(out), [])
+        self.assertEqual(converter.validate(out), [])
         self.assertEqual(conv.stats["synthetic_results"], 1)
 
     def test_orphan_result_does_not_break_validation(self):
@@ -120,7 +121,7 @@ class TestConvert(unittest.TestCase):
             ri({"type": "custom_tool_call_output", "call_id": "ghost",
                 "output": [{"type": "input_text", "text": "stray"}]}),
         ])
-        self.assertEqual(ci.validate(out), [])
+        self.assertEqual(converter.validate(out), [])
         self.assertEqual(conv.stats["orphan_results"], 1)
 
     def test_reasoning_never_becomes_a_thinking_block(self):
@@ -144,7 +145,7 @@ class TestConvert(unittest.TestCase):
         kinds = {b["type"] for r in out for b in
                  (r["message"]["content"] if isinstance(r["message"]["content"], list) else [])}
         self.assertNotIn("tool_use", kinds)
-        self.assertEqual(ci.validate(out), [])
+        self.assertEqual(converter.validate(out), [])
 
     def test_parent_uuid_chain(self):
         _, out = convert([
@@ -160,54 +161,30 @@ class TestProvenance(unittest.TestCase):
         sess = {"id": "01a0", "ts": "2026-09-16T09:00:00Z", "originator": "Codex Desktop",
                 "path": Path("/x/rollout.jsonl")}
         conv, _ = convert([])
-        conv.emit_user(ci.provenance_banner(sess, "faithful"), sess["ts"], meta=True)
+        conv.emit_user(converter.provenance_banner(sess, "faithful"), sess["ts"], meta=True)
         rec = conv.out[-1]
         self.assertTrue(rec["isMeta"])
         self.assertIn("01a0", rec["message"]["content"])
         self.assertIn("rollout.jsonl", rec["message"]["content"])
 
     def test_ledger_lives_outside_the_checkout(self):
-        # Deleting or moving this repo must not orphan the imports it created.
-        self.assertNotIn("codeximporterforclaude", str(ci.LEDGER))
-        self.assertTrue(str(ci.LEDGER).endswith("codex-imports.json"))
+        # Deleting or moving the app must not orphan the imports it created.
+        self.assertFalse(converter.LEDGER.is_relative_to(Path(__file__).resolve().parent.parent))
+        self.assertTrue(str(converter.LEDGER).endswith("codex-imports.json"))
 
 
 class TestPaths(unittest.TestCase):
     def test_slug_rule(self):
-        self.assertEqual(ci.slug_for("/Users/you/code/app/.claude/worktrees/x-0a9"),
+        self.assertEqual(converter.slug_for("/Users/you/code/app/.claude/worktrees/x-0a9"),
                          "-Users-you-code-app--claude-worktrees-x-0a9")
 
     def test_scratch_dirs_collapse_to_one_folder(self):
-        self.assertEqual(ci.group_scratch("/Users/you/Documents/Codex/2026-09-17/thread-slug"),
+        self.assertEqual(converter.group_scratch("/Users/you/Documents/Codex/2026-09-17/thread-slug"),
                          "/Users/you/Documents/Codex")
 
     def test_real_projects_are_left_alone(self):
         for p in ("/Users/you/code/app", "/Users/you/Documents/Codex"):
-            self.assertEqual(ci.group_scratch(p), p)
-
-
-class TestAccountMove(unittest.TestCase):
-    def test_conversation_fields_move_account_fields_do_not(self):
-        import desktop_register as dr
-        src = {"sessionId": "local_old", "cliSessionId": "abc", "title": "Sample chat",
-               "cwd": "/p", "createdAt": 1, "lastFocusedAt": 2, "model": "m1",
-               "worktreePath": "/p/.claude/worktrees/x", "codexImport": {"id": "t"},
-               "toolSurfaceSnapshot": "old", "remoteMcpServersConfig": ["old"],
-               "envScopeId": "old-env", "error": "boom"}
-        tmpl = {"sessionId": "local_tmpl", "cliSessionId": "zzz", "title": "Other",
-                "toolSurfaceSnapshot": "new", "remoteMcpServersConfig": ["new"],
-                "promptAppendSnapshot": "new", "error": "stale"}
-        out = dr.transfer(src, tmpl)
-        for k in ("cliSessionId", "title", "cwd", "createdAt", "lastFocusedAt",
-                  "model", "worktreePath", "codexImport"):
-            self.assertEqual(out[k], src[k], k)
-        self.assertEqual(out["toolSurfaceSnapshot"], "new")
-        self.assertEqual(out["remoteMcpServersConfig"], ["new"])
-        self.assertEqual(out["promptAppendSnapshot"], "new")
-        self.assertNotIn("envScopeId", out)
-        self.assertNotIn("error", out)
-        self.assertTrue(out["sessionId"].startswith("local_"))
-        self.assertNotIn(out["sessionId"], ("local_old", "local_tmpl"))
+            self.assertEqual(converter.group_scratch(p), p)
 
 
 def ev(kind, **kw):
@@ -219,11 +196,10 @@ def jsonl(recs):
     return ("\n".join(json.dumps(r) for r in recs) + "\n").encode()
 
 
-class TestCodexDiscovery(unittest.TestCase):
-    """Thread/revert lineage and internal Codex sessions must not pollute /resume."""
+class TestRolloutLineage(unittest.TestCase):
+    """Thread/revert revisions rebuild one conversation; internal threads are identified."""
 
     def setUp(self):
-        import tempfile
         self.tmp_obj = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp_obj.cleanup)
         self.tmp = Path(self.tmp_obj.name)
@@ -248,6 +224,12 @@ class TestCodexDiscovery(unittest.TestCase):
         path.write_bytes(jsonl(rows))
         return path
 
+    def newest(self):
+        """The newest rollout, with its ancestor chain resolved."""
+        found = [converter.summarize(p) for p in sorted(self.tmp.glob("*.jsonl"))]
+        converter.resolve_lineage(found[-1], {s["rollout_id"]: s for s in found if s["rollout_id"]})
+        return found[-1]
+
     def test_latest_revision_keeps_only_retained_ancestor_prefix(self):
         tid = "01a1ab29-4f15-7150-ac01-306e71950872"
         rev = "01a1ab2a-6170-77c3-a956-655e435eed77"
@@ -259,14 +241,12 @@ class TestCodexDiscovery(unittest.TestCase):
                           base={"thread_id": tid, "end_byte_offset": cutoff,
                                 "end_ordinal_exclusive": 2},
                           user="Revised real prompt", assistant="New answer")
-        available = ci.discover(self.tmp)
-        self.assertEqual(len(available), 1)
-        self.assertEqual(available[0]["revisions"], 2)
-        self.assertEqual(available[0]["rollout_id"], rev)
-        rows = ci.read_lineage(available[0])
+        latest = self.newest()
+        self.assertEqual(latest["rollout_id"], rev)
+        rows = converter.read_lineage(latest)
         messages = [(r.get("payload") or {}).get("content") for r in rows
                     if r.get("type") == "response_item"]
-        texts = [ci.text_of(m) for m in messages]
+        texts = [converter.text_of(m) for m in messages]
         self.assertEqual(texts, ["Original user prompt", "Revised real prompt", "New answer"])
 
     def test_missing_ancestor_never_silently_imports_partial_history(self):
@@ -275,24 +255,25 @@ class TestCodexDiscovery(unittest.TestCase):
         self.make_rollout("2026-11-05T05-04-03", tid,
                           base={"thread_id": missing, "end_byte_offset": 10,
                                 "end_ordinal_exclusive": 1})
-        sess = ci.discover(self.tmp)[0]
+        sess = self.newest()
         self.assertIn("missing", sess["lineage_error"])
         with self.assertRaises(ValueError):
-            ci.read_lineage(sess)
+            converter.read_lineage(sess)
 
-    def test_subagents_and_guardian_are_excluded_by_default(self):
+    def test_subagents_and_guardian_are_marked_internal(self):
         ids = [
             "01a1ab29-4f15-7150-ac01-306e71950872",
             "01a1ab2a-6170-77c3-a956-655e435eed77",
             "01a1ab2b-2a5b-7dd1-a5a6-2afe01cb0c59",
         ]
-        self.make_rollout("2026-11-05T05-02-58", ids[0])
-        self.make_rollout("2026-11-05T05-04-03", ids[1],
+        real = self.make_rollout("2026-11-05T05-02-58", ids[0])
+        agent = self.make_rollout("2026-11-05T05-04-03", ids[1],
                           source={"subagent": {"thread_spawn": {"parent_thread_id": ids[0]}}})
-        self.make_rollout("2026-11-05T05-04-55", ids[2],
+        guardian = self.make_rollout("2026-11-05T05-04-55", ids[2],
                           source={"internal": "guardian"})
-        self.assertEqual(len(ci.discover(self.tmp)), 1)
-        self.assertEqual(len(ci.discover(self.tmp, include_internal=True)), 3)
+        self.assertFalse(converter.summarize(real)["internal"])
+        self.assertTrue(converter.summarize(agent)["internal"])
+        self.assertTrue(converter.summarize(guardian)["internal"])
 
     def test_generated_user_messages_do_not_become_human_prompts(self):
         for prompt in (
@@ -300,15 +281,15 @@ class TestCodexDiscovery(unittest.TestCase):
             "The following is the Codex agent history added since your last approval assessment."
         ):
             with self.subTest(prompt=prompt):
-                bg, human = ci.split_user_message(prompt)
+                bg, human = converter.split_user_message(prompt)
                 self.assertTrue(bg)
                 self.assertEqual(human, "")
-                self.assertEqual(ci.clean_title(prompt), "")
+                self.assertEqual(converter.clean_title(prompt), "")
                 conv, _ = convert([
                     ri({"type": "message", "role": "user",
                         "content": [{"type": "input_text", "text": prompt}]})
                 ])
-                self.assertFalse(ci.has_conversation(conv.stats))
+                self.assertFalse(converter.has_conversation(conv.stats))
 
 
 class TestContextBudget(unittest.TestCase):
@@ -333,12 +314,12 @@ class TestContextBudget(unittest.TestCase):
         return out
 
     def test_preserves_recent_turn_pairs_and_under_budget(self):
-        import context_budget as cb
+        from contextbridge import context_budget as cb
         original = self.build()
-        before = ci.validate(original)
+        before = converter.validate(original)
         tail, stats = cb.fit_context(original, 16000, 900)
         self.assertEqual(before, [])
-        self.assertEqual(ci.validate(tail), [])
+        self.assertEqual(converter.validate(tail), [])
         self.assertLessEqual(cb.estimate_tokens(tail), 16000)
         self.assertLess(stats["after"], stats["before"])
         self.assertGreater(stats["omitted"], 0)
@@ -356,7 +337,7 @@ class TestContextBudget(unittest.TestCase):
         self.assertTrue(all("toolUseResult" not in r for r in tail))
 
     def test_pathological_single_turn_falls_back_to_prose(self):
-        import context_budget as cb
+        from contextbridge import context_budget as cb
         records = [
             ri({"type": "message", "role": "user",
                 "content": [{"type": "input_text", "text": "Fix important component"}]})
@@ -374,7 +355,7 @@ class TestContextBudget(unittest.TestCase):
         _, out = convert(records)
         tail, stats = cb.fit_context(out, 6000, 600)
         self.assertLessEqual(cb.estimate_tokens(tail), 6000)
-        self.assertEqual(ci.validate(tail), [])
+        self.assertEqual(converter.validate(tail), [])
         self.assertTrue(any(r.get("type") == "assistant" for r in tail))
         self.assertTrue(any("Critical conclusion" in str((r.get("message") or {}).get("content"))
                             for r in tail))
@@ -383,27 +364,21 @@ class TestContextBudget(unittest.TestCase):
                              if isinstance(b, dict)))
 
 
-class TestBoundedReimportIntegration(unittest.TestCase):
-    """End-to-end: preview writes nothing, in-place replace backs up exactly one import."""
+class TestBoundedRebuild(unittest.TestCase):
+    """A preview writes nothing, and rebuilding in place backs up exactly one transcript."""
 
     def setUp(self):
-        import tempfile
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.codex_dir = self.root / "codex"
-        self.codex_dir.mkdir()
-        self.claude_dir = self.root / "claude" / "projects"
-        self.claude_dir.mkdir(parents=True)
-        self.orig_ledger, self.orig_backups = ci.LEDGER, ci.BACKUPS
-        ci.LEDGER = self.root / "claude" / "codex-imports.json"
-        ci.BACKUPS = self.root / "claude" / "codex-import-backups"
+        self.orig_backups = converter.BACKUPS
+        converter.BACKUPS = self.root / "claude" / "codex-import-backups"
         self.addCleanup(self.restore)
-        self.tid = "01a1ab29-4f15-7150-ac01-306e71950872"
-        path = self.codex_dir / f"rollout-2026-11-05T05-04-03-{self.tid}.jsonl"
+        tid = "01a1ab29-4f15-7150-ac01-306e71950872"
+        path = self.root / f"rollout-2026-11-05T05-04-03-{tid}.jsonl"
         rows = [
             {"type": "session_meta", "payload": {
-                "id": self.tid, "timestamp": "2026-11-05T05:04:03Z",
+                "id": tid, "timestamp": "2026-11-05T05:04:03Z",
                 "cwd": str(self.root), "source": "cli", "originator": "Codex Desktop"
             }},
         ]
@@ -419,96 +394,78 @@ class TestBoundedReimportIntegration(unittest.TestCase):
                     "type": "output_text", "text": f"Change number {idx} complete"}]}),
             ]
         path.write_bytes(jsonl(rows))
+        self.sess = converter.summarize(path)
+        converter.resolve_lineage(self.sess, {})
+        self.projects = self.root / "claude" / "projects"
 
     def restore(self):
-        ci.LEDGER, ci.BACKUPS = self.orig_ledger, self.orig_backups
+        converter.BACKUPS = self.orig_backups
 
-    def options(self, **kw):
-        from argparse import Namespace
-        opts = dict(codex_dir=str(self.codex_dir), claude_dir=str(self.claude_dir),
-                    session=self.tid[:8], all=False, include_internal=False,
-                    include_round_trips=False, no_sync=False,
-                    mode="faithful", keep_developer=False, force=False,
-                    replace=False, context_budget=None, max_tool_chars=700,
-                    summary_mode="index", summary_tokens=2000, summary_model="sonnet",
-                    summary_max_usd=2.0, summary_max_calls=16, summary_file=None,
-                    no_group_scratch=False, no_banner=False, title_prefix="",
-                    dry_run=False, desktop=False)
+    def args(self, **kw):
+        opts = dict(mode="faithful", keep_developer=False, context_budget=None,
+                    max_tool_chars=700, summary_mode="index", summary_tokens=2000,
+                    summary_model="sonnet", summary_max_usd=2.0, summary_max_calls=16,
+                    summary_file=None, no_group_scratch=False, no_banner=False,
+                    title_prefix="", dry_run=False)
         opts.update(kw)
-        return Namespace(**opts)
+        return SimpleNamespace(**opts)
 
-    def test_replace_has_dry_run_and_backup(self):
-        import contextlib, io
-        def run(**kw):
-            with contextlib.redirect_stdout(io.StringIO()) as log:
-                ci.cmd_import(self.options(**kw))
-            return log.getvalue()
+    def build(self, entry=None, **kw):
+        return converter.build_import(self.sess, self.args(**kw), "2.1.271", replace_entry=entry)
 
-        run()
-        original_entry = ci.load_ledger()[self.tid]
-        target = Path(original_entry["transcript"])
+    def imported(self):
+        built = self.build()
+        target = self.projects / "project" / f"{built['conv'].session_id}.jsonl"
+        target.parent.mkdir(parents=True)
+        converter.write_import(target, built["lines"])
+        return target, converter.ledger_entry(self.sess, built, target, None, self.args())
+
+    def test_preview_writes_nothing_and_rebuild_backs_up(self):
+        target, entry = self.imported()
         original = target.read_bytes()
         self.assertGreater(len(original), 100000)
-        dry_output = run(replace=True, context_budget=12000, dry_run=True)
-        self.assertIn("would replace", dry_output)
+        self.build(entry, context_budget=12000, dry_run=True)
         self.assertEqual(target.read_bytes(), original)
-        self.assertFalse(ci.BACKUPS.exists())
-        run(replace=True, context_budget=12000)
-        entry = ci.load_ledger()[self.tid]
-        self.assertEqual(entry["transcript"], str(target))
-        self.assertEqual(entry["claudeSessionId"], original_entry["claudeSessionId"])
-        self.assertEqual(entry["contextBudget"], 12000)
+        self.assertFalse(converter.BACKUPS.exists())
+
+        converter.verify_replace_target(target, entry, str(self.projects))
+        built = self.build(entry, context_budget=12000)
+        backup = converter.write_import(target, built["lines"], replace=True)
         self.assertLess(target.stat().st_size, len(original))
-        self.assertEqual(list(ci.BACKUPS.glob("*.jsonl"))[0].read_bytes(), original)
+        self.assertEqual(backup.read_bytes(), original)
+        self.assertLess(built["budget"]["after"], built["budget"]["before"])
 
         imported = [json.loads(line) for line in target.read_text().splitlines()]
         chain = [r for r in imported if r.get("type") in ("user", "assistant")]
-        self.assertEqual(ci.validate(chain), [])
-        self.assertEqual(len({r["sessionId"] for r in chain}), 1)
+        self.assertEqual(converter.validate(chain), [])
+        self.assertEqual({r["sessionId"] for r in chain}, {entry["claudeSessionId"]})
 
-    def test_ai_summary_not_called_in_dry_run_and_replacement_preflight(self):
-        import contextlib, io
-        from unittest.mock import patch
-
-        def run(**kw):
-            with contextlib.redirect_stdout(io.StringIO()) as log:
-                ci.cmd_import(self.options(**kw))
-            return log.getvalue()
-
-        run()
-        entry = ci.load_ledger()[self.tid]
-        target = Path(entry["transcript"])
-        original = target.read_bytes()
+    def test_ai_summary_not_called_in_preview_or_after_claude_continues(self):
+        target, entry = self.imported()
         summary = ("AI-GENERATED CODEX HISTORY SUMMARY. Implemented changes and "
                    "verified tests [T0001].")
-        with patch.object(ci, "claude_summary",
+        with patch.object(converter, "claude_summary",
                           return_value=(summary, {"calls": 1, "cache_hits": 0})) as mock_ai:
-            output = run(replace=True, context_budget=12000,
-                         summary_mode="claude", dry_run=True)
+            built = self.build(entry, context_budget=12000, summary_mode="claude", dry_run=True)
             mock_ai.assert_not_called()
-            self.assertIn("Claude AI calls skipped", output)
-            self.assertEqual(target.read_bytes(), original)
+            self.assertTrue(built["summary"]["dry_run_skipped_claude"])
 
-            output = run(replace=True, context_budget=12000, summary_mode="claude")
+            built = self.build(entry, context_budget=12000, summary_mode="claude")
             self.assertEqual(mock_ai.call_count, 1)
-            self.assertIn("historical summary: claude", output)
-            self.assertIn("AI-GENERATED", target.read_text())
+            self.assertEqual(built["summary"]["mode"], "claude")
+            self.assertIn("AI-GENERATED", "\n".join(built["lines"]))
 
-            # Claude has since continued this session, so a future attempt
-            # must abort BEFORE issuing any additional billable model call.
+            # Claude has since continued this session, so a rebuild is refused before
+            # anything would spend another billable call.
             with target.open("a") as file:
                 file.write(json.dumps({"type": "assistant",
                                        "message": {"model": "claude-opus-4-8"}}) + "\n")
-            before = target.read_bytes()
-            with self.assertRaisesRegex(SystemExit, "Claude has continued"):
-                run(replace=True, context_budget=12000, summary_mode="claude")
-            self.assertEqual(target.read_bytes(), before)
-            self.assertEqual(mock_ai.call_count, 1)
+            with self.assertRaisesRegex(converter.ReplaceRefused, "Claude has continued"):
+                converter.verify_replace_target(target, entry, str(self.projects))
 
 
 class TestSafeReplace(unittest.TestCase):
     def setUp(self):
-        import tempfile
         self.tmp_obj = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp_obj.cleanup)
         self.root = Path(self.tmp_obj.name) / "projects"
@@ -525,31 +482,30 @@ class TestSafeReplace(unittest.TestCase):
 
     def test_owned_uncontinued_import_is_replacable(self):
         self.write()
-        ci.verify_replace_target(self.target, self.entry, str(self.root))
+        converter.verify_replace_target(self.target, self.entry, str(self.root))
 
     def test_native_claude_turn_is_never_overwritten(self):
         self.write("claude-opus-4-8")
-        with self.assertRaises(SystemExit):
-            ci.verify_replace_target(self.target, self.entry, str(self.root))
+        with self.assertRaises(converter.ReplaceRefused):
+            converter.verify_replace_target(self.target, self.entry, str(self.root))
 
     def test_missing_provenance_is_rejected(self):
         self.write(marker="not-ours")
-        with self.assertRaises(SystemExit):
-            ci.verify_replace_target(self.target, self.entry, str(self.root))
+        with self.assertRaises(converter.ReplaceRefused):
+            converter.verify_replace_target(self.target, self.entry, str(self.root))
 
     def test_outside_project_folder_is_rejected(self):
         self.write()
-        with self.assertRaises(SystemExit):
-            ci.verify_replace_target(self.target, self.entry, str(self.root / "other"))
+        with self.assertRaises(converter.ReplaceRefused):
+            converter.verify_replace_target(self.target, self.entry, str(self.root / "other"))
 
 
 class TestSync(unittest.TestCase):
     """A thread that moved on in Codex after it reached Claude."""
 
     def setUp(self):
-        import tempfile
         self.tmp = Path(tempfile.mkdtemp())
-        ci.BACKUPS = self.tmp / "backups"
+        converter.BACKUPS = self.tmp / "backups"
         # A native Claude session: two chain records, then session metadata.
         self.transcript = self.tmp / "native.jsonl"
         self.transcript.write_text("\n".join(json.dumps(r) for r in [
@@ -584,16 +540,16 @@ class TestSync(unittest.TestCase):
                      "ts": "2026-09-16T09:00:00.000Z", "first_user": "x"}
 
     def append(self, data, start):
-        return ci.append_codex_turns(self.sess, data, start, self.transcript,
-                                     mode="archive", keep_developer=False,
-                                     version="2.1.271", native=True)
+        return converter.append_codex_records(self.sess, converter.records_from(data, start), start,
+                                              self.transcript, mode="archive", keep_developer=False,
+                                              version="2.1.271", native=True)
 
     def records(self):
         return [json.loads(l) for l in self.transcript.read_text().splitlines()]
 
     def test_round_trip_appends_only_the_codex_side_turns(self):
         data = jsonl(self.claude_part + self.codex_turn)
-        start = ci.external_import_end(ci.records_from(data))
+        start = external_import_end(converter.records_from(data))
         res = self.append(data, start)
         self.assertEqual(res["errs"], [])
         new = self.records()[3:]
@@ -611,7 +567,7 @@ class TestSync(unittest.TestCase):
 
     def test_second_run_brings_only_what_is_newer(self):
         data = jsonl(self.claude_part + self.codex_turn)
-        first = self.append(data, ci.external_import_end(ci.records_from(data)))
+        first = self.append(data, external_import_end(converter.records_from(data)))
         self.assertEqual(self.append(data, first["end"])["out"], [])
         more = [dict(r) for r in self.codex_turn]
         more[1] = ri({"type": "message", "role": "user", "content": [{"type": "input_text",
@@ -624,20 +580,13 @@ class TestSync(unittest.TestCase):
 
     def test_line_still_being_written_is_left_for_next_time(self):
         data = jsonl(self.claude_part) + b'{"type": "response_item", "payl'
-        self.assertEqual(ci.records_from(data)[-1][0], len(jsonl(self.claude_part)))
+        self.assertEqual(converter.records_from(data)[-1][0], len(jsonl(self.claude_part)))
 
-    def test_legacy_ledger_offset_recovered_from_sha(self):
-        import hashlib
+    def test_ledger_offset_recovered_from_sha(self):
         old = jsonl(self.claude_part)
         digest = hashlib.sha256(old).hexdigest()
-        self.assertEqual(ci.prefix_offset(old + jsonl(self.codex_turn), digest), len(old))
-        self.assertIsNone(ci.prefix_offset(b"rewritten\n" + old, digest))
-
-    def test_scan_never_mistakes_a_synced_native_session_for_an_import(self):
-        data = jsonl(self.claude_part + self.codex_turn)
-        self.append(data, ci.external_import_end(ci.records_from(data)))
-        self.assertEqual(ci.first_assistant_model(self.transcript.read_text()),
-                         "claude-fable-5-1")
+        self.assertEqual(converter.prefix_offset(old + jsonl(self.codex_turn), digest), len(old))
+        self.assertIsNone(converter.prefix_offset(b"rewritten\n" + old, digest))
 
 
 if __name__ == "__main__":

@@ -1,49 +1,42 @@
-#!/usr/bin/env python3
-"""
-codex_import — convert OpenAI Codex rollout transcripts into Claude Code sessions.
+"""Convert OpenAI Codex rollout transcripts into Claude Code sessions.
 
 Codex writes one JSONL "rollout" per thread under ~/.codex/sessions/YYYY/MM/DD/.
 Claude Code reads one JSONL per session from ~/.claude/projects/<slug>/<uuid>.jsonl,
 where <slug> is the session's cwd with every non-alphanumeric character replaced by
 a dash. The desktop app additionally needs a session card (see desktop_register.py).
+
+Names written to disk (`codex-imports.json`, `codex-import-backups`, the `codex-import`
+and `codex-imported` markers) identify sessions that already exist, so they must not change.
 """
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
 import re
 import subprocess
-import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
-import desktop_register
-from context_budget import fit_context
-from history_summary import evidence_turns, offline_digest, claude_summary
+from .context_budget import fit_context
+from .history_summary import evidence_turns, offline_digest, claude_summary
 
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
-# Codex records every Claude session it imported here. Those threads are Claude
-# history that already round-tripped once; importing them whole would duplicate
-# transcripts the user already has, so only their Codex-side turns come back.
+# Codex records every Claude session it imported here.
 CODEX_IMPORT_LEDGER = Path.home() / ".codex" / "external_agent_session_imports.json"
-# Our own ledger, so a re-run skips what it already did and `uninstall` can remove
-# exactly what we created and nothing else. It lives beside the data it describes,
-# not in this checkout: moving or deleting the tool must not orphan the imports.
+# Our own ledger. It lives beside the data it describes, not with the app: moving or
+# deleting the app must not orphan the imports.
 LEDGER = Path.home() / ".claude" / "codex-imports.json"
-LEGACY_LEDGER = Path(__file__).resolve().parent.parent / "imported.json"
 
 TOOL_VERSION = "1.0"
 
 # Stamped into every assistant record we synthesise.
 IMPORT_MODEL = "codex-imported"
 # Stamped on the trailing custom-title record of every transcript we write. Unlike
-# IMPORT_MODEL it is present even in a session with no assistant turns, so it is what
-# `uninstall --scan` fingerprints when the ledger is missing.
+# IMPORT_MODEL it is present even in a session with no assistant turns, so it identifies
+# our transcripts when the ledger is missing.
 IMPORT_MARK = "codex-import"
 
 # Codex record types that carry conversation content. Everything else in a rollout
@@ -362,10 +355,6 @@ def locate_rollout(recorded: Path | str) -> Path:
     return next((c for c in candidates if c.is_file()), path)
 
 
-def rollout_length(path: Path) -> int:
-    return len(rollout_bytes(path)) if is_compressed(Path(path)) else Path(path).stat().st_size
-
-
 def records_from(data: bytes, start: int = 0) -> list[tuple[int, dict]]:
     """(offset just past the line, record) for each complete JSON line in data[start:].
 
@@ -387,21 +376,6 @@ def records_from(data: bytes, start: int = 0) -> list[tuple[int, dict]]:
     return out
 
 
-def read_rollout(path: Path) -> list[dict]:
-    return [r for _, r in records_from(rollout_bytes(path))]
-
-
-def external_import_end(recs: list[tuple[int, dict]]) -> int | None:
-    """Offset just past the Claude history Codex replayed into a round-trip thread."""
-    end = None
-    for off, r in recs:
-        p = r.get("payload") or {}
-        if (r.get("type") == "event_msg" and p.get("type") == "task_complete"
-                and str(p.get("turn_id", "")).startswith(EXTERNAL_TURN_PREFIX)):
-            end = off
-    return end
-
-
 def prefix_offset(data: bytes, digest: str) -> int | None:
     """Length of the line-aligned prefix of `data` whose sha256 is `digest`.
 
@@ -420,17 +394,6 @@ def prefix_offset(data: bytes, digest: str) -> int | None:
         end = len(data) if nl < 0 else nl + 1
         h.update(data[pos:end])
         pos = end
-
-
-def round_tripped_ids() -> dict[str, str]:
-    """Codex thread id -> the Claude transcript it was originally imported from."""
-    try:
-        data = json.loads(CODEX_IMPORT_LEDGER.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    recs = data.get("records", data if isinstance(data, list) else [])
-    return {r["imported_thread_id"]: normalize_path(r.get("source_path", ""))
-            for r in recs if r.get("imported_thread_id")}
 
 
 # Codex's thread/revert writes a new immutable rollout with the SAME thread id
@@ -557,59 +520,23 @@ def read_lineage(sess: dict) -> list[dict]:
     return records
 
 
-def discover(root: Path, include_internal: bool = False) -> list[dict]:
-    all_sessions = []
-    for p in sorted([*root.rglob("*.jsonl"), *root.rglob("*.jsonl.zst")]):
-        try:
-            s = summarize(p)
-        except (OSError, EOFError, ValueError, RuntimeError) as err:
-            print(f"! unreadable rollout {p.name}: {err}", file=sys.stderr)
-            continue
-        if s:
-            all_sessions.append(s)
-    rollouts = {s["rollout_id"]: s for s in all_sessions if s["rollout_id"]}
-    # One logical thread may have many immutable reverted revisions. The newest
-    # rollout is the best available filesystem fallback without Codex's SQLite index.
-    by_thread = {}
-    for s in sorted(all_sessions, key=lambda s: (s["ts"], s["path"].name)):
-        if s["internal"] and not include_internal:
-            continue
-        key = s["id"] or str(s["path"])
-        by_thread[key] = s
-    out = list(by_thread.values())
-    counts = {}
-    for s in all_sessions:
-        counts[s["id"]] = counts.get(s["id"], 0) + 1
-    ledger = round_tripped_ids()
-    for s in out:
-        s["revisions"] = counts.get(s["id"], 1)
-        s["round_trip"] = ledger.get(s["id"] or "", "")
-        resolve_lineage(s, rollouts)
-    out.sort(key=lambda s: (s["ts"], s["path"].name))
-    return out
-
-
 # -------------------------------------------------------------------------- ledger
 
 def load_ledger() -> dict:
-    for path in (LEDGER, LEGACY_LEDGER):
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-    return {}
+    try:
+        return json.loads(LEDGER.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 def save_ledger(d: dict) -> None:
     atomic_write_bytes(LEDGER, json.dumps(d, indent=2, sort_keys=True).encode("utf-8"))
-    if LEGACY_LEDGER.exists():
-        LEGACY_LEDGER.unlink()
 
 
 def provenance_banner(sess: dict, mode: str) -> str:
     """Shown as background at the top of an imported thread, so its origin is visible
     when the session is opened, not only recorded in metadata."""
-    return (f"Imported from OpenAI Codex by codeximporterforclaude {TOOL_VERSION}.\n"
+    return (f"Imported from OpenAI Codex by ContextBridge {TOOL_VERSION}.\n"
             f"Codex thread {sess['id']}, started {sess['ts'][:19]} "
             f"({sess['originator'] or 'codex'}).\n"
             f"Source rollout: {sess['path']}\n"
@@ -878,64 +805,6 @@ def human_text(rec: dict) -> str | None:
     return split_user_message(content)[1] or None
 
 
-def native_turns_after(path: Path, offset: int = 0, since_ms: int | None = None) -> int:
-    """Claude's own turns in a transcript past a byte offset, optionally only those
-    newer than a time. Turns this tool converted and appended don't count."""
-    count = 0
-    with Path(path).open("rb") as fh:
-        fh.seek(offset)
-        for raw in fh:
-            if not raw.endswith(b"\n") or b'"api-request' in raw[:400]:
-                continue
-            try:
-                rec = json.loads(raw)
-            except ValueError:
-                continue
-            if rec.get("isSidechain") or rec.get("type") not in ("user", "assistant"):
-                continue
-            if since_ms is not None and (ms_of(rec.get("timestamp") or "") or 0) <= since_ms:
-                continue
-            if rec["type"] == "assistant":
-                count += (rec.get("message") or {}).get("model") not in SYNTHETIC_MODELS
-            elif human_text(rec) and not is_converter_record(rec):
-                count += 1
-    return count
-
-
-def claude_side_checkpoint(target: Path, entry: dict | None, thread_id: str
-                           ) -> tuple[int | None, int | None]:
-    """(byte offset, time in ms) past which Claude work is new to the Codex thread.
-
-    Newest evidence first: the size recorded after our last write, our last provenance
-    record in the transcript, then what Codex's own ledger says it imported. Both None
-    means the boundary can't be established.
-    """
-    if entry and entry.get("transcriptBytes") is not None:
-        recorded = entry["transcriptBytes"]
-        return (recorded, None) if recorded <= target.stat().st_size else (None, None)
-    if entry:
-        mark = None
-        with target.open("rb") as fh:
-            position = 0
-            for raw in fh:
-                position += len(raw)
-                if b'"custom-title"' in raw and IMPORT_MARK.encode() in raw:
-                    mark = position
-        if mark is not None:
-            return mark, None
-        when = ms_of(entry.get("syncedAt") or entry.get("importedAt") or "")
-        return None, when
-    try:
-        records = json.loads(CODEX_IMPORT_LEDGER.read_text(encoding="utf-8")).get("records", [])
-    except (OSError, ValueError):
-        return None, None
-    digest = next((r.get("content_sha256") for r in records
-                   if r.get("imported_thread_id") == thread_id), None)
-    if not digest:
-        return None, None
-    return prefix_offset(target.read_bytes(), digest), None
-
-
 def transcript_tail(path: Path) -> dict:
     """Where an existing Claude transcript's conversation ends, and what it is called."""
     info = {"leaf": None, "cwd": None, "sessionId": None, "title": None, "lastTs": ""}
@@ -958,30 +827,19 @@ def transcript_tail(path: Path) -> dict:
 def sync_banner(sess: dict, mode: str, first: str, last: str) -> str:
     return (f"Continued in OpenAI Codex, {first[:16].replace('T', ' ')} to "
             f"{last[:16].replace('T', ' ')} UTC. Brought across by "
-            f"codeximporterforclaude {TOOL_VERSION} from Codex thread {sess['id']}.\n"
+            f"ContextBridge {TOOL_VERSION} from Codex thread {sess['id']}.\n"
             f"Source rollout: {sess['path']}\n"
             f"Mode: {mode}. Reasoning is not carried over.")
-
-
-def append_codex_turns(sess: dict, data: bytes, start: int, target: Path, *, mode: str,
-                       keep_developer: bool, version: str, banner: bool = True,
-                       native: bool = False, dry_run: bool = False) -> dict:
-    """Convert the rollout past byte `start` and continue `target`'s conversation with it.
-
-    `native` means the transcript is a Claude session rather than one this tool wrote,
-    so no import title/provenance record is appended to it.
-    """
-    return append_codex_records(sess, records_from(data, start), start, target, mode=mode,
-                                keep_developer=keep_developer, version=version,
-                                banner=banner, native=native, dry_run=dry_run,
-                                digest_of=lambda end: hashlib.sha256(data[:end]).hexdigest())
 
 
 def append_codex_records(sess: dict, recs: list[tuple[int, dict]], start: int, target: Path,
                          *, mode: str, keep_developer: bool, version: str,
                          banner: bool = True, native: bool = False, dry_run: bool = False,
                          digest_of=None, transform=None) -> dict:
-    """Records-based core of append_codex_turns.
+    """Convert `recs` and continue `target`'s conversation with them.
+
+    `native` means the transcript is a Claude session rather than one this app wrote, so
+    no import title or provenance record is appended to it.
 
     `recs` are (offset past the line, record) pairs not yet in `target`; `digest_of`
     fingerprints the source up to an offset. `transform`, when given, may rewrite the
@@ -1042,174 +900,22 @@ def append_codex_records(sess: dict, recs: list[tuple[int, dict]], start: int, t
     return result
 
 
-# ----------------------------------------------------------------------------- cli
-
-def cmd_list(args):
-    sessions = discover(Path(args.codex_dir), include_internal=args.include_internal)
-    if not sessions:
-        print(f"No Codex rollouts found under {args.codex_dir}")
-        return
-    done = load_ledger()
-    print(f"{len(sessions)} Codex session(s) under {args.codex_dir}\n")
-    for s in sessions:
-        tags = []
-        if s["round_trip"]:
-            tags.append("round-trip from Claude")
-        if s["revisions"] > 1:
-            tags.append(f'{s["revisions"]} revisions; latest selected')
-        if s.get("lineage_error"):
-            tags.append(f'lineage unavailable: {s["lineage_error"]}')
-        if s["id"] in done:
-            tags.append("synced back" if done[s["id"]].get("kind") == "round-trip"
-                        else "already imported")
-        tag = f"  [{'; '.join(tags)}]" if tags else ""
-        print(f"  {s['id']}{tag}")
-        lines = "zstd" if s["lines"] is None else f"{s['lines']} lines"
-        print(f"    {s['ts'][:19]}  {lines:>12}  {s['originator']}")
-        print(f"    cwd: {s['cwd'] or '(none)'}")
-        print(f"    {s['first_user'] or '(no user message)'}")
-        print()
-
-
-def cmd_import(args):
-    sessions = discover(Path(args.codex_dir), include_internal=args.include_internal)
-    if args.session:
-        sessions = [s for s in sessions if s["id"] and s["id"].startswith(args.session)]
-        if not sessions:
-            sys.exit(f"No Codex session matching {args.session!r}")
-    elif not args.all:
-        sys.exit("Pass --all, or --session <id-prefix>. Use list to see them.")
-    if args.context_budget is not None and args.context_budget < 5000:
-        sys.exit("--context-budget must be at least 5000")
-    if args.summary_tokens < 1000 or args.summary_tokens > 30000:
-        sys.exit("--summary-tokens must be between 1000 and 30000")
-    if args.summary_max_usd <= 0:
-        sys.exit("--summary-max-usd must be positive")
-    if args.summary_max_calls < 1:
-        sys.exit("--summary-max-calls must be positive")
-    if args.summary_file and args.context_budget is None:
-        sys.exit("--summary-file requires --context-budget")
-    if args.summary_mode == "claude" and args.context_budget is None:
-        sys.exit("--summary-mode claude requires --context-budget")
-    if (args.context_budget is not None
-            and (args.summary_mode != "off" or args.summary_file)
-            and args.context_budget <= args.summary_tokens + 4000):
-        sys.exit("context budget must leave 4000 tokens beyond summary reserve")
-    if args.replace and (not args.session or len(sessions) != 1 or args.all or args.force):
-        sys.exit("--replace requires exactly one --session, without --all/--force")
-
-    # Threads already in Claude — ours, or Claude sessions Codex imported — get any
-    # newer Codex turns appended instead of a second copy.
-    ledger = load_ledger()
-    syncs, fresh = [], []
-    for s in sessions:
-        entry = ledger.get(s["id"])
-        if args.replace:
-            if not entry or entry.get("kind") != "import":
-                sys.exit("--replace requires a session previously imported by this tool")
-            fresh.append(s)
-        elif s["round_trip"] and not args.include_round_trips:
-            (syncs if not args.no_sync else []).append(s)
-            if args.no_sync:
-                print(f"skip {s['id'][:8]}  (round-trip: Codex imported this from "
-                      f"{Path(s['round_trip']).name})")
-        elif entry and not args.force:
-            (syncs if not args.no_sync else []).append(s)
-            if args.no_sync:
-                print(f"skip {s['id'][:8]}  (already imported {entry['importedAt'][:10]})")
-        else:
-            fresh.append(s)
-
-    version = claude_version()
-    state = {"warned": False, "current": 0, "appended": 0}
-    for s in syncs:
-        sync_one(s, ledger.get(s["id"]), args, version, ledger, state)
-    if state["current"]:
-        print(f"  -- {state['current']} already in Claude and up to date\n")
-    if state.get("diverged"):
-        print(f"  -- {state['diverged']} skipped because Claude has its own newer work\n")
-    sessions = fresh
-
-    if not sessions:
-        if not state["appended"] and not state.get("diverged"):
-            print("Nothing to do.")
-        return
-
-    if args.desktop and not args.dry_run and desktop_register.desktop_running():
-        print("! Claude desktop is running. It caches the session list in memory and "
-              "may not\n  pick these up until relaunch. Quit it first, or quit and "
-              "reopen afterwards.\n")
-
-    for s in sessions:
-        old_target = None
-        old_entry = None
-        if not s.get("lineage_error") and args.replace:
-            # Refuse overwriting native Claude work BEFORE any Claude summary calls.
-            old_entry = ledger[s["id"]]
-            old_target = Path(old_entry["transcript"])
-            verify_replace_target(old_target, old_entry, args.claude_dir)
-        try:
-            built = build_import(s, args, version, replace_entry=old_entry)
-        except ImportSkipped as err:
-            print(f"skip {s['id'][:8]}  ({err})")
-            continue
-        conv, out, cwd, title = built["conv"], built["out"], built["cwd"], built["title"]
-        budget_info, summary_info, errs = built["budget"], built["summary"], built["errs"]
-        target_dir = Path(args.claude_dir) / slug_for(cwd)
-        target = old_target or target_dir / f"{conv.session_id}.jsonl"
-
-        if not args.dry_run:
-            backup = write_import(target, built["lines"], replace=old_target is not None)
-            if backup:
-                print(f"    original backed up: {backup}")
-
-        card = None
-        if args.desktop:
-            card = desktop_register.register(
-                conv.session_id, cwd, title, created_ms=ms_of(s["ts"]),
-                turns=conv.stats["user"], dry_run=args.dry_run,
-                provenance={"source": IMPORT_MARK, "codexThreadId": s["id"],
-                            "codexRollout": str(s["path"]),
-                            "importToolVersion": TOOL_VERSION})
-
-        action = "replace" if old_target is not None else "write"
-        print(f"{'would ' if args.dry_run else ''}{action} {target}")
-        print(f"    from {s['path'].name}")
-        print(f"    title: {title}")
-        print_stats(conv.stats, errs)
-        if budget_info:
-            print(f"    estimated message context: {budget_info['before']:,} -> {budget_info['after']:,} tokens (budget {args.context_budget:,}, approximate)")
-            print(f"    retained {budget_info['retained']} historical records; "
-                  f"omitted {budget_info['omitted']}; shortened "
-                  f"{budget_info['trimmed']} large blocks")
-            if summary_info:
-                print(f"    historical summary: {summary_info['mode']} "
-                      f"({summary_info['turns']} earlier human turns; "
-                      f"~{budget_info['summary_estimate']:,} estimated note tokens)")
-                if summary_info.get("dry_run_skipped_claude"):
-                    print("    dry-run: Claude AI calls skipped; final summary "
-                          "size and retained turn count may vary")
-                if summary_info.get("calls") is not None:
-                    print(f"    Claude summary calls: {summary_info['calls']}; "
-                          f"cache hits: {summary_info['cache_hits']}")
-        if args.desktop:
-            print(f"    desktop card: {card.name if card else '! registry not found'}")
-
-        if not args.dry_run:
-            ledger[s["id"]] = ledger_entry(s, built, target, card, args)
-            save_ledger(ledger)
-        print()
+# ------------------------------------------------------------------- whole imports
 
 
 class ImportSkipped(Exception):
     """A session cannot be converted; the message says why, nothing was written."""
 
 
+class ReplaceRefused(ValueError):
+    """A bounded session cannot be rebuilt in place; the message says why."""
+
+
 def build_import(s: dict, args, version: str, replace_entry: dict | None = None,
                  extra_banner: str | None = None) -> dict:
     """Convert one Codex thread to Claude records, in memory, writing nothing.
 
-    Shared by the CLI and ContextBridge. `args` needs the import option attributes.
+    `args` needs the import option attributes.
     A dry-run swaps Claude summaries for the offline digest, so previews stay free.
     """
     if s.get("lineage_error"):
@@ -1327,7 +1033,6 @@ def ledger_entry(s: dict, built: dict, target: Path, card, args) -> dict:
         "sourceSha256": built["digest"],
         "sourceMtime": int(s["path"].stat().st_mtime),
         "sourceBytes": built["consumed"],
-        "transcriptBytes": target.stat().st_size,
         "kind": "import",
         "mode": args.mode,
         "contextBudget": args.context_budget,
@@ -1340,11 +1045,11 @@ def ledger_entry(s: dict, built: dict, target: Path, card, args) -> dict:
 def verify_replace_target(target: Path, entry: dict, claude_dir: str) -> None:
     """Never replace a native or continued Claude session by accident."""
     if not target.is_file():
-        raise SystemExit(f"cannot --replace: imported transcript is missing: {target}")
+        raise ReplaceRefused(f"The imported transcript is missing: {target}")
     if not target.resolve().is_relative_to(Path(claude_dir).resolve()):
-        raise SystemExit(f"cannot --replace: target is outside Claude projects: {target}")
+        raise ReplaceRefused(f"The target is outside Claude projects: {target}")
     if target.stem != entry.get("claudeSessionId"):
-        raise SystemExit("cannot --replace: existing transcript has unexpected session ID")
+        raise ReplaceRefused("The existing transcript has an unexpected session ID.")
     found_mark = False
     with target.open(encoding="utf-8") as f:
         for line in f:
@@ -1357,553 +1062,12 @@ def verify_replace_target(target: Path, entry: dict, claude_dir: str) -> None:
             if record.get("type") == "assistant":
                 model = (record.get("message") or {}).get("model")
                 if model != IMPORT_MODEL:
-                    raise SystemExit("cannot --replace: Claude has continued this session; "
-                                     "use a fresh import instead to preserve those turns")
+                    raise ReplaceRefused("Claude has continued this session; use a new session "
+                                         "instead to preserve those turns.")
     if not found_mark:
-        raise SystemExit("cannot --replace: missing importer provenance marker")
+        raise ReplaceRefused("The transcript has no import provenance marker.")
 
 
 def has_conversation(stats: dict) -> bool:
     """Do not import an internal-only background transcript."""
     return any(stats[k] for k in ("user", "assistant", "tool_use", "tool_result"))
-
-
-def print_stats(st: dict, errs: list[str]) -> None:
-    print(f"    {st['user']} user, {st['assistant']} assistant, "
-          f"{st['tool_use']} tool calls, {st['tool_result']} results, "
-          f"{st['background']} background")
-    print(f"    reasoning: {st['reasoning_kept']} kept as text, "
-          f"{st['reasoning_dropped']} dropped (encrypted, unrecoverable)")
-    if st["synthetic_results"]:
-        print(f"    backfilled {st['synthetic_results']} missing tool result(s)")
-    if st["orphan_results"]:
-        print(f"    {st['orphan_results']} orphaned tool output(s) kept as text")
-    if errs:
-        print("    VALIDATION:")
-        for e in errs[:10]:
-            print(f"      ! {e}")
-
-
-CONTINUATION_HINT = ("`contextbridge send {tid} --strategy continuation --yes` keeps them "
-                     "separate, and --allow-divergent appends anyway")
-
-
-def sync_one(s: dict, entry: dict | None, args, version: str, ledger: dict,
-             state: dict) -> None:
-    """Append Codex turns newer than what Claude already has for this thread."""
-    tid = s["id"]
-    if entry and entry.get("contextBudget"):
-        print(f"skip {tid[:8]}  (context-limited import; use import --replace "
-              "with --session and --context-budget to refresh safely)")
-        return
-    # A revert replaces the active rollout and can change/remove earlier turns.
-    # Appending new revision bytes to the old Claude session would corrupt history.
-    if (entry and entry.get("sourceRollout")
-            and not same_rollout(entry["sourceRollout"], s["path"])):
-        print(f"skip {tid[:8]}  (Codex rollout revision changed; "
-              "use import --force to import the new revision separately)")
-        return
-    native = entry is None or entry.get("kind") == "round-trip"
-    size = rollout_length(s["path"])
-    if entry and entry.get("sourceBytes") == size:
-        state["current"] += 1
-        return
-    data = rollout_bytes(s["path"])
-    if entry and entry.get("sourceBytes") is not None:
-        start = entry["sourceBytes"]
-    elif entry:
-        start = prefix_offset(data, entry.get("sourceSha256", ""))
-    else:
-        start = external_import_end(records_from(data))
-    if start is None or start > len(data):
-        print(f"skip {tid[:8]}  (" + (
-            "the rollout was rewritten rather than appended to since import; "
-            "`import --force` re-imports it" if entry else
-            "round-trip, but there is no marker for where Codex's copy of the Claude "
-            "history ends") + ")")
-        return
-    newer = records_from(data, start)
-    if not any(r.get("type") == "response_item"
-               and (r.get("payload") or {}).get("type") in CONTENT_TYPES
-               for _, r in newer):
-        state["current"] += 1
-        end = newer[-1][0] if newer else start
-        if entry and not args.dry_run and entry.get("sourceBytes") != end:
-            entry["sourceBytes"] = end
-            entry["sourceMtime"] = int(s["path"].stat().st_mtime)
-            save_ledger(ledger)
-        return
-
-    target = Path(entry["transcript"] if entry else s["round_trip"])
-    if not target.exists():
-        hits = list(Path(args.claude_dir).glob(f"*/{target.stem}.jsonl"))
-        if not hits:
-            print(f"skip {tid[:8]}  (" + (
-                "has newer Codex turns, but its Claude transcript is gone; "
-                "`import --force` makes a fresh copy" if entry else
-                "round-trip with newer Codex turns, but the Claude session Codex "
-                "imported it from is gone; --include-round-trips imports it as a new "
-                "session") + ")")
-            return
-        target = hits[0]
-
-    if not getattr(args, "allow_divergent", False):
-        offset, since = claude_side_checkpoint(target, entry, tid)
-        if offset is None and since is None:
-            print(f"skip {tid[:8]}  (can't establish what Claude session {target.stem[:8]} had "
-                  "at the last transfer, so appending could merge diverged work. Nothing was "
-                  "changed; " + CONTINUATION_HINT.format(tid=tid[:13]) + ")")
-            state["diverged"] = state.get("diverged", 0) + 1
-            return
-        moved = native_turns_after(target, offset or 0, since)
-        if moved:
-            print(f"skip {tid[:8]}  (both agents moved on: Claude session {target.stem[:8]} has "
-                  f"{moved} native turn(s) since the last transfer. Nothing was changed; "
-                  + CONTINUATION_HINT.format(tid=tid[:13]) + ")")
-            state["diverged"] = state.get("diverged", 0) + 1
-            return
-
-    mode = entry.get("mode", args.mode) if entry else args.mode
-    res = append_codex_turns(s, data, start, target, mode=mode,
-                             keep_developer=args.keep_developer, version=version,
-                             banner=not args.no_banner, native=native,
-                             dry_run=args.dry_run)
-    if res["errs"]:
-        print(f"skip {tid[:8]}  (converted turns failed validation; nothing was "
-              f"appended: {res['errs'][:3]})")
-        return
-    if not res["out"]:
-        state["current"] += 1
-        if entry and not args.dry_run and entry.get("sourceBytes") != res["end"]:
-            entry["sourceBytes"] = res["end"]
-            save_ledger(ledger)
-        return
-
-    if not args.dry_run and not state["warned"] and desktop_register.desktop_running():
-        state["warned"] = True
-        print("! Claude desktop is running. A session it already has open keeps its "
-              "cached copy,\n  and a message sent there would branch off before the "
-              "Codex turns. Quit and\n  reopen it before continuing these sessions.\n")
-
-    state["appended"] += 1
-    tail = res["tail"]
-    title = tail["title"] or (entry or {}).get("title") or s["first_user"]
-    print(f"{'would append to' if args.dry_run else 'appended to'} {target}")
-    print(f"    from {s['path'].name}, Codex turns {res['first'][:16].replace('T', ' ')}"
-          f" to {res['last'][:16].replace('T', ' ')}")
-    print(f"    title: {title}" + ("  (native Claude session; Codex imported it)"
-                                   if native else ""))
-    print_stats(res["stats"], res["errs"])
-    if tail["lastTs"] > res["first"]:
-        print(f"    note: this session also moved on in Claude (last turn "
-              f"{tail['lastTs'][:16].replace('T', ' ')}); the Codex turns follow it "
-              "because --allow-divergent was given")
-    if args.dry_run:
-        print()
-        return
-
-    cards = desktop_register.touch(res["sessionId"], ms_of(res["last"]),
-                                   res["stats"]["user"])
-    print(f"    backup: {res['backup']}")
-    print(f"    desktop card(s) updated: {len(cards)}")
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    entry = ledger.setdefault(tid, {
-        "claudeSessionId": res["sessionId"], "card": str(cards[0]) if cards else None,
-        "cwd": tail["cwd"], "title": title, "importedAt": now, "kind": "round-trip",
-        "sourceRollout": str(s["path"]), "mode": mode})
-    entry.update({"transcript": str(target), "syncedAt": now,
-                  "sourceSha256": res["digest"], "sourceBytes": res["end"],
-                  "sourceMtime": int(s["path"].stat().st_mtime),
-                  "transcriptBytes": target.stat().st_size,
-                  "toolVersion": TOOL_VERSION})
-    save_ledger(ledger)
-    print()
-
-
-def first_assistant_model(head: str) -> str | None:
-    """Model of the first assistant record. Ours for a transcript this tool wrote; a
-    real Claude model for a native session, even one Codex turns were appended to."""
-    for line in head.splitlines():
-        try:
-            r = json.loads(line)
-        except Exception:
-            continue
-        if r.get("type") == "assistant":
-            return (r.get("message") or {}).get("model")
-    return None
-
-
-def cmd_uninstall(args):
-    """Remove what this tool created — transcripts and desktop cards — and nothing else."""
-    ledger = load_ledger()
-    entries = list(ledger.items())
-
-    if args.scan:
-        # Fallback for imports whose ledger entry is gone. Every transcript we write
-        # ends with a custom-title record carrying IMPORT_MARK — present even in a
-        # session with no assistant turns, unlike the IMPORT_MODEL stamp.
-        known = {v["transcript"] for v in ledger.values()}
-        for p in sorted(Path(args.claude_dir).glob("*/*.jsonl")):
-            if str(p) in known:
-                continue
-            try:
-                with p.open("rb") as fh:
-                    fh.seek(max(0, p.stat().st_size - 8192))
-                    tail = fh.read().decode("utf-8", "replace")
-                    fh.seek(0)
-                    head = fh.read(200_000).decode("utf-8", "replace")
-            except Exception:
-                continue
-            title = None
-            for line in tail.splitlines():
-                if IMPORT_MARK in line and '"custom-title"' in line:
-                    try:
-                        title = json.loads(line).get("customTitle")
-                    except Exception:
-                        title = "(found by scan)"
-                    break
-            if title is None and first_assistant_model(head) == IMPORT_MODEL:
-                title = "(found by scan)"
-            if title is not None:
-                entries.append((f"scan:{p.stem}", {"transcript": str(p), "card": None,
-                                                   "title": title}))
-
-    if not entries:
-        print("Nothing to remove.")
-        return
-
-    cards = {}
-    reg = desktop_register.registry_dir()
-    if reg:
-        for f in reg.glob("local_*.json"):
-            try:
-                cards[json.loads(f.read_text(encoding="utf-8")).get("cliSessionId")] = f
-            except Exception:
-                pass
-
-    print(f"{'Would remove' if args.dry_run else 'Removing'} {len(entries)} import(s):\n")
-    for key, v in entries:
-        t = Path(v["transcript"])
-        if v.get("kind") == "round-trip":
-            # A Claude session of the user's own that Codex turns were appended to.
-            # It and its card stay; only our record of the sync goes.
-            print(f"  {v.get('title', '')[:56]}")
-            print(f"    kept:       {t}  (native Claude session; the appended Codex "
-                  f"turns stay, backups in {BACKUPS})")
-            if not args.dry_run:
-                ledger.pop(key, None)
-            continue
-        card = Path(v["card"]) if v.get("card") else cards.get(t.stem)
-        print(f"  {v.get('title', '')[:56]}")
-        print(f"    transcript: {t}{'' if t.exists() else '  (already gone)'}")
-        print(f"    card:       {card if card else '(none)'}")
-        if not args.dry_run:
-            t.unlink(missing_ok=True)
-            if card and card.exists():
-                card.unlink()
-            ledger.pop(key, None)
-    if args.orphan_cards and reg:
-        dead = []
-        for f in reg.glob("local_*.json"):
-            try:
-                d = json.loads(f.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            cli = d.get("cliSessionId")
-            if cli and not list(Path(args.claude_dir).glob(f"*/{cli}.jsonl")):
-                dead.append((f, d.get("title", "")))
-        if dead:
-            print(f"\n{'Would remove' if args.dry_run else 'Removing'} "
-                  f"{len(dead)} card(s) with no transcript:")
-            for f, t in dead:
-                print(f"    {t[:58]}  ({f.name})")
-                if not args.dry_run:
-                    f.unlink()
-
-    if not args.dry_run:
-        save_ledger(ledger)
-        print("\nRelaunch Claude desktop for the sidebar to catch up.")
-
-
-def dead_cards(claude_dir: str) -> list[tuple[Path, str]]:
-    """Desktop cards whose transcript is gone — the sidebar rows that open on
-    'session not found on disk'."""
-    reg = desktop_register.registry_dir()
-    out = []
-    if not reg:
-        return out
-    for f in sorted(reg.glob("local_*.json")):
-        try:
-            d = json.loads(f.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        cli = d.get("cliSessionId")
-        if cli and not list(Path(claude_dir).glob(f"*/{cli}.jsonl")):
-            out.append((f, d.get("title", "")))
-    return out
-
-
-def cmd_repair(args):
-    """Clear dead sidebar rows and re-import anything whose transcript went missing.
-
-    Claude desktop keeps the session list in memory and writes it back, so cards
-    deleted while it is running can reappear. Quit it before repairing.
-    """
-    if desktop_register.desktop_running():
-        print("! Claude desktop is running. It rewrites cards from memory, so ones "
-              "removed now\n  can come back. Quit it, run this again, then reopen.\n")
-
-    dead = dead_cards(args.claude_dir)
-    if dead:
-        print(f"{'Would remove' if args.dry_run else 'Removing'} {len(dead)} dead "
-              f"sidebar row(s):")
-        for f, t in dead:
-            print(f"    {t[:60]}")
-            if not args.dry_run:
-                f.unlink()
-        print()
-    else:
-        print("No dead sidebar rows.\n")
-
-    ledger = load_ledger()
-    missing = {tid: v for tid, v in ledger.items() if not Path(v["transcript"]).exists()}
-    if missing:
-        print(f"{len(missing)} import(s) lost their transcript:")
-        for tid, v in missing.items():
-            print(f"    {v['title'][:60]}")
-        print("\n  Re-import them with:  import --all --force"
-              if not args.dry_run else "")
-    else:
-        print("All recorded imports still have their transcript.")
-
-
-def cmd_status(args):
-    """Show what has been imported, and whether both sides still line up."""
-    ledger = load_ledger()
-    if not ledger:
-        print(f"No imports recorded ({LEDGER} is empty or missing).")
-        return
-    reg = desktop_register.registry_dir()
-    cards = {}
-    if reg:
-        for f in reg.glob("local_*.json"):
-            try:
-                cards[json.loads(f.read_text(encoding="utf-8")).get("cliSessionId")] = f
-            except Exception:
-                pass
-
-    print(f"{len(ledger)} import(s) recorded in {LEDGER}\n")
-    issues = 0
-    for tid, v in sorted(ledger.items(), key=lambda kv: kv[1]["importedAt"]):
-        t = Path(v["transcript"])
-        src = locate_rollout(v.get("sourceRollout", ""))
-        card = Path(v["card"]) if v.get("card") else cards.get(t.stem)
-        notes = []
-        if not t.exists():
-            notes.append("transcript missing")
-        if card is None or not card.exists():
-            notes.append("no desktop card")
-        if not src.exists():
-            notes.append("source rollout gone")
-        elif (rollout_length(src) != v["sourceBytes"] if v.get("sourceBytes") is not None
-              else v.get("sourceMtime") and int(src.stat().st_mtime) != v["sourceMtime"]):
-            notes.append("source rollout changed since import")
-        issues += bool(notes)
-        print(f"  {'!' if notes else ' '} {v['title'][:56]}")
-        print(f"      codex {tid}  ->  claude {v['claudeSessionId']}")
-        print(f"      {v['importedAt'][:19]}  mode={v.get('mode','?')}  cwd={v['cwd']}")
-        if notes:
-            print(f"      ! {'; '.join(notes)}")
-    print(f"\n{len(ledger) - issues} healthy, {issues} needing attention.")
-
-
-def account_label(reg: Path) -> str:
-    return f"{reg.parent.name[:8]}/{reg.name[:8]}"
-
-
-def resolve_registry(spec: str | None, default: Path | None, role: str) -> Path | None:
-    regs = desktop_register.registries()
-    if spec:
-        hits = [r for r in regs if f"{r.parent.name}/{r.name}".startswith(spec)
-                or r.parent.name.startswith(spec)]
-        if len(hits) != 1:
-            sys.exit(f"--{role} {spec!r} matches {len(hits)} registries; pass "
-                     f"<account>/<workspace> (prefixes are fine)")
-        return hits[0]
-    return default
-
-
-def cmd_move_account(args):
-    """Bring desktop session cards from another account into the active one.
-
-    Transcripts live in ~/.claude/projects/ and belong to no account, so they are
-    already usable from any login on this machine. What is per-account is the desktop
-    app's card registry — which is why signing into another account empties the
-    sidebar. This copies the cards across, so the same conversations appear (and can
-    be continued) under the new account.
-    """
-    dst = resolve_registry(args.to, desktop_register.registry_dir(), "to")
-    if dst is None:
-        sys.exit("No destination registry found. Open Claude desktop signed into the "
-                 "target account and start one session there first, then retry.")
-    others = [r for r in desktop_register.registries() if r != dst]
-    src = resolve_registry(args.from_, others[0] if len(others) == 1 else None, "from")
-    if src is None:
-        print("Several source registries; pick one with --from:")
-        for r in others:
-            print(f"    {r.parent.name}/{r.name}  {len(list(r.glob('local_*.json')))} "
-                  f"card(s)  {account_label(r)}")
-        return
-    if src == dst:
-        sys.exit("Source and destination are the same registry.")
-
-    template = desktop_register.template_entry(dst)
-    have = desktop_register.cards_by_cli_id(dst)
-    print(f"from  {account_label(src)}\nto    {account_label(dst)}\n")
-
-    if not args.dry_run and desktop_register.desktop_running():
-        print("! Claude desktop is running and caches the session list. Quit and "
-              "reopen it\n  afterwards; if any row is missing, run this again — it "
-              "skips what is already there.\n")
-
-    ledger = load_ledger()
-    by_claude_id = {v["claudeSessionId"]: tid for tid, v in ledger.items()}
-    moved = skipped = missing = 0
-    for f in sorted(src.glob("local_*.json"), key=lambda p: p.stat().st_mtime):
-        card = json.loads(f.read_text(encoding="utf-8"))
-        cli = card.get("cliSessionId")
-        title = card.get("title", "")[:60]
-        if cli in have:
-            skipped += 1
-            print(f"  skip  {title}  (already in destination)")
-            continue
-        if not cli or not list(Path(args.claude_dir).glob(f"*/{cli}.jsonl")):
-            missing += 1
-            print(f"  skip  {title}  (transcript not on disk)")
-            continue
-        entry = desktop_register.transfer(card, template)
-        target = dst / f"{entry['sessionId']}.json"
-        print(f"  {'would copy' if args.dry_run else 'copy'}  {title}")
-        moved += 1
-        if args.dry_run:
-            continue
-        target.write_text(json.dumps(entry, indent=2), encoding="utf-8")
-        if args.remove_source:
-            f.unlink()
-        if cli in by_claude_id:
-            ledger[by_claude_id[cli]]["card"] = str(target)
-
-    if not args.dry_run and moved:
-        save_ledger(ledger)
-    verb = "would copy" if args.dry_run else ("moved" if args.remove_source else "copied")
-    print(f"\n{verb} {moved}; {skipped} already there; "
-          f"{missing} without a transcript")
-    if not args.dry_run and moved:
-        print("Quit and reopen Claude desktop for the sidebar to pick them up.")
-
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--codex-dir", default=str(CODEX_SESSIONS))
-    ap.add_argument("--claude-dir", default=str(CLAUDE_PROJECTS))
-    sub = ap.add_subparsers(dest="cmd", required=True)
-
-    listing = sub.add_parser("list", help="show the Codex sessions available to import")
-    listing.add_argument("--include-internal", action="store_true",
-                         help="include Codex subagents and internal reviewer sessions")
-
-    imp = sub.add_parser("import", help="convert Codex sessions into Claude Code transcripts")
-    imp.add_argument("--session", help="Codex session id (prefix match)")
-    imp.add_argument("--all", action="store_true", help="import every session found")
-    imp.add_argument("--include-internal", action="store_true",
-                     help="also import Codex subagents and internal reviewer sessions")
-    imp.add_argument("--mode", choices=["archive", "faithful"], default="archive",
-                     help="archive: tool traffic flattened to readable text, always "
-                          "safe to resume. faithful: real tool_use/tool_result pairs, "
-                          "richer UI, replays foreign tool names to the API.")
-    imp.add_argument("--keep-developer", action="store_true",
-                     help="keep Codex developer/system injections as background messages")
-    imp.add_argument("--include-round-trips", action="store_true",
-                     help="import Codex threads that Codex itself imported from Claude "
-                          "Code as new sessions (default: append their Codex-side "
-                          "turns to the Claude session they came from)")
-    imp.add_argument("--force", action="store_true",
-                     help="re-import sessions this tool has already imported, as a "
-                          "fresh copy, instead of appending their newer Codex turns")
-    imp.add_argument("--context-budget", type=int, metavar="TOKENS",
-                     help="create a lossy working history bounded by a conservative "
-                          "token estimate; keep original Codex rollout untouched")
-    imp.add_argument("--max-tool-chars", type=int, default=3000, metavar="CHARS",
-                     help="max historical tool input/output chars in bounded mode (default: 3000)")
-    imp.add_argument("--summary-mode", choices=("off", "index", "claude"), default="index",
-                     help="off: old excerpt note; index: grounded offline digest (default); "
-                          "claude: opt-in AI summary using Claude Code CLI, consumes usage")
-    imp.add_argument("--summary-tokens", type=int, default=8000, metavar="TOKENS",
-                     help="estimated tokens reserved for historical summary (default: 8000)")
-    imp.add_argument("--summary-model", default="sonnet", metavar="MODEL",
-                     help="Claude Code model alias for opt-in AI summarization (default: sonnet)")
-    imp.add_argument("--summary-max-usd", type=float, default=2.0, metavar="USD",
-                     help="Claude Code max-budget cap PER summary call (default: $2)")
-    imp.add_argument("--summary-max-calls", type=int, default=16, metavar="COUNT",
-                     help="safety cap on total Claude summary calls (default: 16); "
-                          "raise explicitly for very large omitted histories")
-    imp.add_argument("--summary-file", metavar="PATH",
-                     help="use a pre-written or reviewed history summary as a local text file")
-    imp.add_argument("--replace", action="store_true",
-                     help="safely replace one previous import in place after backup; "
-                          "requires --session, refuses new Claude work")
-    imp.add_argument("--no-sync", action="store_true",
-                     help="skip threads already in Claude instead of appending the "
-                          "Codex turns they gained since")
-    imp.add_argument("--allow-divergent", action="store_true",
-                     help="append new Codex turns even when the Claude session has its own "
-                          "newer work (default: skip it, so histories never merge silently)")
-    imp.add_argument("--desktop", action="store_true",
-                     help="also register each session with the Claude desktop app so "
-                          "it appears in the sidebar (relaunch the app afterwards)")
-    imp.add_argument("--title-prefix", default="",
-                     help="prefix every imported title, e.g. '[codex] ' (default: none)")
-    imp.add_argument("--no-group-scratch", action="store_true",
-                     help="keep Codex Desktop's per-thread scratch dirs as separate "
-                          "sidebar folders instead of collapsing them")
-    imp.add_argument("--no-banner", action="store_true",
-                     help="omit the background provenance banner at the top of each "
-                          "imported thread (metadata is still recorded)")
-    imp.add_argument("--dry-run", action="store_true")
-
-    sub.add_parser("status", help="show what has been imported and whether it is intact")
-
-    rep = sub.add_parser("repair",
-                         help="clear sidebar rows whose transcript is gone "
-                              "('session not found on disk') and report lost imports")
-    rep.add_argument("--dry-run", action="store_true")
-
-    un = sub.add_parser("uninstall", help="remove transcripts and cards this tool created")
-    un.add_argument("--scan", action="store_true",
-                    help="also find imports missing from the ledger, by fingerprint")
-    un.add_argument("--orphan-cards", action="store_true",
-                    help="also remove desktop cards whose transcript no longer exists "
-                         "(dead sidebar rows, from any source)")
-    un.add_argument("--dry-run", action="store_true")
-
-    mv = sub.add_parser("move-account",
-                        help="copy desktop sidebar sessions from another account (e.g. "
-                             "one you signed out of) into the active one")
-    mv.add_argument("--from", dest="from_", metavar="ACCOUNT[/WORKSPACE]",
-                    help="source registry (default: the only other one with sessions)")
-    mv.add_argument("--to", metavar="ACCOUNT[/WORKSPACE]",
-                    help="destination registry (default: the account signed in now)")
-    mv.add_argument("--remove-source", action="store_true",
-                    help="delete the source cards after copying (default: keep them, "
-                         "so the sessions still show if you sign back in)")
-    mv.add_argument("--dry-run", action="store_true")
-
-    args = ap.parse_args()
-    {"list": cmd_list, "import": cmd_import, "status": cmd_status,
-     "repair": cmd_repair, "uninstall": cmd_uninstall,
-     "move-account": cmd_move_account}[args.cmd](args)
-
-
-if __name__ == "__main__":
-    main()

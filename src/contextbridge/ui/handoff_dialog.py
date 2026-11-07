@@ -8,8 +8,9 @@ from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFormLayout,
-                               QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton, QRadioButton,
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+                               QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
+                               QPushButton, QRadioButton,
                                QSpinBox, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget)
 
 from ..handoff import HandoffError, HandoffOptions, HandoffPlan
@@ -47,12 +48,17 @@ def saved_options() -> HandoffOptions:
     s = QSettings("ContextBridge", "ContextBridge")
     defaults = HandoffOptions()
     budget = s.value("budget", defaults.context_budget)
+    summary = s.value("summary_mode", "index")
     return HandoffOptions(
         mode=s.value("mode", defaults.mode),
         keep_developer=s.value("keep_developer", defaults.keep_developer, type=bool),
         context_budget=None if budget in (None, "", "none") else int(budget),
         max_tool_chars=s.value("max_tool_chars", defaults.max_tool_chars, type=int),
-        summary_mode="index" if s.value("summary_mode", "index") == "claude" else s.value("summary_mode", "index"),
+        # AI use is authorized per transfer, and a file is chosen per transfer.
+        summary_mode="index" if summary in ("claude", "file") else summary,
+        title_prefix=s.value("title_prefix", defaults.title_prefix),
+        group_scratch=s.value("group_scratch", defaults.group_scratch, type=bool),
+        include_banner=s.value("include_banner", defaults.include_banner, type=bool),
         summary_tokens=s.value("summary_tokens", defaults.summary_tokens, type=int),
         summary_model=s.value("summary_model", defaults.summary_model),
         summary_max_usd=s.value("summary_max_usd", defaults.summary_max_usd, type=float),
@@ -64,7 +70,8 @@ def save_options(o: HandoffOptions) -> None:
     s = QSettings("ContextBridge", "ContextBridge")
     s.setValue("budget", "none" if o.context_budget is None else o.context_budget)
     for key in ("mode", "keep_developer", "max_tool_chars", "summary_mode", "summary_tokens",
-                "summary_model", "summary_max_usd", "summary_max_calls"):
+                "summary_model", "summary_max_usd", "summary_max_calls", "title_prefix", "group_scratch",
+                "include_banner"):
         s.setValue(key, getattr(o, key))
 
 
@@ -201,11 +208,31 @@ class HandoffDialog(QDialog):
         self.keep_dev = QCheckBox("Keep Codex developer instructions as background messages")
         self.keep_dev_label = label("")
         form.addRow(self.keep_dev_label, self.keep_dev)
+        self.title_prefix = QLineEdit()
+        self.title_prefix.setPlaceholderText("Optional, for example [codex]")
+        self.title_prefix_label = label("Title prefix")
+        form.addRow(self.title_prefix_label, self.title_prefix)
+        self.group_scratch = QCheckBox("Group Codex's per-thread scratch folders into one sidebar folder")
+        self.group_scratch_label = label("")
+        form.addRow(self.group_scratch_label, self.group_scratch)
+        self.include_banner = QCheckBox("Add a background note naming the source (the record is kept either way)")
+        self.include_banner_label = label("")
+        form.addRow(self.include_banner_label, self.include_banner)
         self.summary_mode = QComboBox()
         self.summary_mode.addItem("Offline evidence index: quoted excerpts, free", "index")
         self.summary_mode.addItem("AI summary by Claude: uses your Claude account", "claude")
+        self.summary_mode.addItem("From a file: a summary you wrote or reviewed", "file")
         self.summary_mode.addItem("Off: only a list of earlier requests", "off")
         form.addRow(label("Earlier history"), self.summary_mode)
+        self.summary_file = QLineEdit()
+        self.summary_file.setPlaceholderText("A text file holding the summary")
+        self.summary_browse = QPushButton("Choose…")
+        self.summary_browse.clicked.connect(self._choose_summary_file)
+        file_row = QHBoxLayout()
+        file_row.addWidget(self.summary_file, 1)
+        file_row.addWidget(self.summary_browse)
+        self.summary_file_label = label("Summary file")
+        form.addRow(self.summary_file_label, file_row)
         self.summary_tokens = QSpinBox()
         self.summary_tokens.setRange(1000, 30000)
         self.summary_tokens.setSingleStep(1000)
@@ -251,6 +278,10 @@ class HandoffDialog(QDialog):
         self.summary_mode.currentIndexChanged.connect(self._form_changed)
         self.ai_model.currentTextChanged.connect(self._form_changed)
         self.keep_dev.toggled.connect(self._form_changed)
+        self.group_scratch.toggled.connect(self._form_changed)
+        self.include_banner.toggled.connect(self._form_changed)
+        self.title_prefix.editingFinished.connect(self._form_changed)
+        self.summary_file.editingFinished.connect(self._form_changed)
         self.ai_authorized.toggled.connect(self._authorization_changed)
         self.desktop.toggled.connect(self._authorization_changed)
         return scroll(body)
@@ -353,6 +384,7 @@ class HandoffDialog(QDialog):
     def _load_options_into_form(self) -> None:
         o = self.options
         widgets = (self.budget, self.budget_custom, self.max_tool, self.mode, self.keep_dev,
+                   self.title_prefix, self.group_scratch, self.include_banner, self.summary_file,
                    self.summary_mode, self.summary_tokens, self.ai_model, self.ai_usd, self.ai_calls)
         for w in widgets:
             w.blockSignals(True)
@@ -368,6 +400,10 @@ class HandoffDialog(QDialog):
         self.max_tool.setValue(o.max_tool_chars)
         self.mode.setCurrentIndex(max(0, self.mode.findData(o.mode)))
         self.keep_dev.setChecked(o.keep_developer)
+        self.title_prefix.setText(o.title_prefix)
+        self.group_scratch.setChecked(o.group_scratch)
+        self.include_banner.setChecked(o.include_banner)
+        self.summary_file.setText(o.summary_file)
         self.summary_mode.setCurrentIndex(max(0, self.summary_mode.findData(o.summary_mode)))
         self.summary_tokens.setValue(o.summary_tokens)
         self.ai_model.setCurrentText(o.summary_model)
@@ -376,6 +412,19 @@ class HandoffDialog(QDialog):
         for w in widgets:
             w.blockSignals(False)
         self.ai_frame.setVisible(o.summary_mode == "claude")
+        self._sync_summary_file()
+
+    def _sync_summary_file(self) -> None:
+        shown = self.summary_mode.currentData() == "file"
+        for widget in (self.summary_file_label, self.summary_file, self.summary_browse):
+            widget.setVisible(shown)
+
+    def _choose_summary_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a history summary", "",
+                                              "Text files (*.txt *.md);;All files (*)")
+        if path:
+            self.summary_file.setText(path)
+            self._form_changed()
 
     def _read_form(self) -> HandoffOptions:
         selected = self.budget.currentData()
@@ -383,6 +432,8 @@ class HandoffDialog(QDialog):
         return replace(
             self.options, context_budget=budget, max_tool_chars=self.max_tool.value(),
             mode=self.mode.currentData(), keep_developer=self.keep_dev.isChecked(),
+            title_prefix=self.title_prefix.text(), group_scratch=self.group_scratch.isChecked(),
+            include_banner=self.include_banner.isChecked(), summary_file=self.summary_file.text().strip(),
             summary_mode=self.summary_mode.currentData(), summary_tokens=self.summary_tokens.value(),
             summary_model=self.ai_model.currentText().strip() or "sonnet",
             summary_max_usd=self.ai_usd.value(), summary_max_calls=self.ai_calls.value(),
@@ -392,6 +443,7 @@ class HandoffDialog(QDialog):
     def _form_changed(self, *_args) -> None:
         self.budget_custom.setVisible(self.budget.currentData() == -1)
         self.ai_frame.setVisible(self.summary_mode.currentData() == "claude")
+        self._sync_summary_file()
         if self.summary_mode.currentData() != "claude":
             self.ai_authorized.setChecked(False)
         self.options = self._read_form()
@@ -486,7 +538,9 @@ class HandoffDialog(QDialog):
         for widget in (self.budget_label, self.budget, self.max_tool_label, self.max_tool):
             widget.setVisible(to_claude or plan.strategy.startswith("delta"))
         self.budget_custom.setVisible(self.budget.currentData() == -1 and self.budget.isVisibleTo(self))
-        for widget in (self.mode_label, self.mode, self.keep_dev_label, self.keep_dev, self.desktop):
+        for widget in (self.mode_label, self.mode, self.keep_dev_label, self.keep_dev, self.desktop,
+                       self.title_prefix_label, self.title_prefix, self.group_scratch_label,
+                       self.group_scratch, self.include_banner_label, self.include_banner):
             widget.setVisible(to_claude)
 
     def _strategy_toggled(self, checked: bool) -> None:
@@ -543,7 +597,7 @@ class HandoffDialog(QDialog):
         if self.options.context_budget and plan.budget:
             rows.append(f"<li>Budget {self.options.context_budget:,}: {plan.budget.get('omitted', 0):,} "
                         "older records left out, recorded in a note at the top</li>")
-        if plan.strategy in ("append", "replace"):
+        if plan.strategy in ("append", "merge", "replace"):
             rows.append("<li>A backup of the existing transcript is made first</li>")
         rows.append("<li>Your source session is not modified; no historical command is run</li>")
         if self.options.summary_mode == "claude" and self._ai_applies():

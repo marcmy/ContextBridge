@@ -12,13 +12,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-import codex_import as ci
+from . import converter
 
 from . import scan
 from .codex_bridge import CodexBridge, CodexUnavailable
 from .discovery import Discovery
 from .handoff import HandoffEngine, HandoffError, HandoffOptions, HandoffPlan
 from .lineage import Lineage
+from .maintenance import ImportRecord, Maintenance, RemovalResult
 from .models import DuplicateCandidate, Link, Provider, Session, SyncState
 from .paths import Roots
 from .reports import HandoffReport
@@ -44,6 +45,22 @@ class CleanupRefused(Exception):
     pass
 
 
+@dataclass
+class BulkRow:
+    session: Session
+    action: str
+    selectable: bool = True
+    checked: bool = True
+
+
+@dataclass
+class BulkResult:
+    session: Session
+    status: str
+    detail: str = ""
+    dest_id: str = ""
+
+
 class ContextBridge:
     def __init__(self, roots: Roots | None = None,
                  bridge_factory: Callable[[], CodexBridge] | None = None, **engine_kwargs):
@@ -55,6 +72,7 @@ class ContextBridge:
         self.engine = HandoffEngine(self.roots, self.store, self.discovery, self.lineage,
                                     bridge_factory=bridge_factory, **engine_kwargs)
         self.bridge_factory = self.engine.bridge_factory
+        self.maintenance = Maintenance(self.roots, self.store)
         self.snapshot: Snapshot = Snapshot()
         self._lock = threading.Lock()
 
@@ -165,7 +183,7 @@ class ContextBridge:
             records = json.loads(self.roots.codex_ledger.read_text(encoding="utf-8")).get("records", [])
         except (OSError, ValueError):
             return
-        by_stem = {Path(ci.normalize_path(r.get("source_path"))).stem: r for r in records}
+        by_stem = {Path(converter.normalize_path(r.get("source_path"))).stem: r for r in records}
         for transfer in pending:
             intent = json.loads(transfer["intent"] or "{}")
             file = Path(intent.get("assisted_file") or "")
@@ -243,6 +261,59 @@ class ContextBridge:
                       src_offset=cp.get("offset"))
         self.store.update_transfer(report.transfer_id, intent=json.dumps(intent))
 
+    # -- bulk import --------------------------------------------------------------------
+    def bulk_rows(self, snapshot: Snapshot | None = None) -> list[BulkRow]:
+        """Codex threads with something to bring to Claude, and those that can't be."""
+        rows = []
+        for s in (snapshot or self.snapshot).sessions:
+            if s.provider is not Provider.CODEX or s.internal or s.archived:
+                continue
+            if s.state is SyncState.NOT_TRANSFERRED:
+                rows.append(BulkRow(s, "Create a new Claude session"))
+            elif s.state is SyncState.SOURCE_ADVANCED:
+                rows.append(BulkRow(s, "Add the new turns to its Claude session"))
+            elif s.state is SyncState.MISSING_DEST:
+                rows.append(BulkRow(s, "Create a new Claude session; the old one is gone", checked=False))
+            elif s.state is SyncState.BOTH_ADVANCED:
+                rows.append(BulkRow(s, "Tick to merge its new turns into the diverged Claude session",
+                                    checked=False))
+            elif s.state in (SyncState.MODIFIED_SOURCE, SyncState.AMBIGUOUS):
+                rows.append(BulkRow(s, "Skipped: use Send to Claude to review it", selectable=False,
+                                    checked=False))
+        return rows
+
+    def bulk_import(self, sessions: list[Session], options: HandoffOptions,
+                    progress: Callable[[str], None] | None = None) -> list[BulkResult]:
+        """Hand off each thread in turn. One failure doesn't stop the others, and each thread
+        gets the plan and safety checks a single handoff would."""
+        say = progress or (lambda _m: None)
+        if options.summary_mode == "claude":
+            raise HandoffError("Bulk import doesn't run AI summaries. Use the offline index.")
+        results = []
+        for s in sessions:
+            say(f"Importing {s.title[:60]}")
+            try:
+                merge = "merge" if s.state is SyncState.BOTH_ADVANCED else None
+                plan = self.plan(s, Provider.CLAUDE, options, merge)
+                if not plan.can_execute:
+                    results.append(BulkResult(s, "skipped", plan.blocked or "Nothing to transfer."))
+                    continue
+                report = self.execute(plan)
+                results.append(BulkResult(s, report.status, report.error or "", report.dest_id or ""))
+            except HandoffError as err:
+                results.append(BulkResult(s, "failed", str(err).split("\n")[0]))
+        return results
+
+    # -- import maintenance -------------------------------------------------------------
+    def desktop_running(self) -> bool:
+        return self.engine.desktop_probe()
+
+    def remove_imports(self, records: list[ImportRecord]) -> RemovalResult:
+        """Protect sessions in use, in code rather than just in the UI."""
+        in_use = {s.session_id for s in self.snapshot.sessions
+                  if s.provider is Provider.CLAUDE and (s.active or s.recent)}
+        return self.maintenance.remove(records, in_use)
+
     # -- cleanup ------------------------------------------------------------------------
     def can_archive(self, s: Session) -> tuple[bool, str]:
         """Protect active and continued sessions, in code rather than just in the UI."""
@@ -307,6 +378,7 @@ class ContextBridge:
             raise CleanupRefused(f"A file already exists at the original location: {original}")
         original.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(entry["archive_path"], str(original))
+        self.maintenance.after_restore(Path(entry["archive_path"]))
         self.store.mark_restored(provider, session_id)
         return f"Restored to {original}."
 

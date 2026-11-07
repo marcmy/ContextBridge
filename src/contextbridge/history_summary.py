@@ -3,7 +3,7 @@
 The offline index quotes historical user/assistant/tool excerpts; it makes no
 claims beyond the source. The optional Claude mode synthesizes chronologically
 bounded evidence chunks, then consolidates them. Claude invocation is explicit,
-has no tools, and never runs on --dry-run. Cached output stays on the local PC.
+has no tools, and never runs for a preview. Cached output stays on the local PC.
 """
 from __future__ import annotations
 
@@ -234,7 +234,7 @@ def claude_summary(
         planned += n
     if planned > max_calls:
         raise ValueError(f"history requires up to {planned} Claude calls; "
-                         f"raise --summary-max-calls above {max_calls} to authorize")
+                         f"raise the call limit above {max_calls} to authorize")
     calls = hits = 0
 
     def validate_grounding(value: str, prompt: str) -> None:

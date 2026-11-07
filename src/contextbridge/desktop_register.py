@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
-"""
-desktop_register — make an imported transcript visible in the Claude desktop app.
+"""Make an imported transcript visible in the Claude desktop app.
 
 Writing `~/.claude/projects/<slug>/<uuid>.jsonl` is enough for the CLI: `claude -r`
 scans that directory directly. The desktop app does not. It lists sessions from its
@@ -30,7 +28,6 @@ import uuid
 from pathlib import Path
 
 
-
 def support_dir(home: Path | None = None) -> Path:
     """The desktop app's data directory for this platform (the macOS path when none
     exists, so callers report 'registry not found' rather than crash)."""
@@ -48,6 +45,14 @@ SUPPORT = support_dir()
 SESSIONS = SUPPORT / "claude-code-sessions"
 CONFIG = SUPPORT / "config.json"
 
+
+def configure_paths(support: Path | None = None) -> None:
+    """Point at another data directory, so sandboxes never touch the real session cards."""
+    global SUPPORT, SESSIONS, CONFIG
+    SUPPORT = Path(support) if support else support_dir()
+    SESSIONS = SUPPORT / "claude-code-sessions"
+    CONFIG = SUPPORT / "config.json"
+
 # Fields that describe one specific past session and must not be inherited
 # from the template entry.
 DROP = {"error", "errorAt", "priorErrorMark", "worktreePath", "worktreeName",
@@ -55,6 +60,15 @@ DROP = {"error", "errorAt", "priorErrorMark", "worktreePath", "worktreeName",
         "scratchPromptRecents", "envScopeId", "chromeTabGroupId",
         "pendingSystemReminder", "resolvedBackgroundTaskSuggestions",
         "writtenBranches", "latestUserFrameAt", "autoChosenInApp", "titleTurn"}
+
+
+# What belongs to the account rather than the conversation. A card copied to another
+# account takes these from that account's own newest card.
+ACCOUNT_BOUND = DROP - {"worktreePath", "worktreeName", "branch", "sourceBranch",
+                        "writtenBranches", "latestUserFrameAt", "titleTurn",
+                        "scratchPromptRecents"} | {
+    "remoteMcpServersConfig", "enabledMcpTools", "promptAppendSnapshot",
+    "toolSurfaceSnapshot", "remoteControlAutoEligible"}
 
 
 def active_account() -> str | None:
@@ -134,17 +148,6 @@ def register(cli_session_id: str, cwd: str, title: str, created_ms: int | None =
     return target
 
 
-# Fields that belong to the account a card was written under rather than to the
-# conversation: the connector list, tool surface and prompt snapshots the app took
-# when that account was signed in, plus transient runtime state. A card moved to
-# another account takes these from that account's own newest card instead.
-ACCOUNT_BOUND = DROP - {"worktreePath", "worktreeName", "branch", "sourceBranch",
-                        "writtenBranches", "latestUserFrameAt", "titleTurn",
-                        "scratchPromptRecents"} | {
-    "remoteMcpServersConfig", "enabledMcpTools", "promptAppendSnapshot",
-    "toolSurfaceSnapshot", "remoteControlAutoEligible"}
-
-
 def registries() -> list[Path]:
     """Every <account>/<workspace> directory holding at least one session card."""
     if not SESSIONS.is_dir():
@@ -213,11 +216,3 @@ def desktop_running() -> bool:
     return subprocess.run(["pgrep", "-qf", "/Applications/Claude.app/Contents/MacOS/Claude"],
                           capture_output=True).returncode == 0
 
-
-if __name__ == "__main__":
-    reg = registry_dir()
-    print(f"registry dir: {reg}")
-    print(f"active account: {active_account()}")
-    if reg:
-        print(f"existing cards: {len(list(reg.glob('local_*.json')))}")
-    print(f"desktop running: {desktop_running()}")

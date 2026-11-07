@@ -18,10 +18,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 
-import codex_import as ci
-import desktop_register
-from context_budget import bound_record, estimate_tokens
-from history_summary import _fit_bytes, claude_summary, evidence_turns, offline_digest
+from . import converter
+from . import desktop_register
+from .context_budget import bound_record, estimate_tokens
+from .history_summary import _fit_bytes, claude_summary, evidence_turns, offline_digest
 
 from . import __version__, scan
 from .codex_bridge import CodexBridge, CodexUnavailable
@@ -52,7 +52,8 @@ class HandoffOptions:
     keep_developer: bool = True
     context_budget: int | None = 400_000
     max_tool_chars: int = 3000
-    summary_mode: str = "index"          # off | index | claude
+    summary_mode: str = "index"          # off | index | claude | file
+    summary_file: str = ""               # a reviewed summary, when summary_mode is "file"
     summary_tokens: int = 8000
     summary_model: str = "sonnet"
     summary_max_usd: float = 2.0
@@ -60,6 +61,7 @@ class HandoffOptions:
     summary_authorized: bool = False     # AI summaries also need this explicit yes
     title_prefix: str = ""
     group_scratch: bool = True
+    include_banner: bool = True
     register_desktop: bool = False
 
     def validate(self) -> None:
@@ -72,16 +74,20 @@ class HandoffOptions:
         if (self.context_budget is not None and self.summary_mode != "off"
                 and self.context_budget <= self.summary_tokens + 4000):
             raise HandoffError("The context budget must leave 4,000 tokens beyond the summary.")
+        if self.summary_mode == "file" and not Path(self.summary_file).is_file():
+            raise HandoffError("Choose an existing text file for the history summary.")
         if self.summary_mode == "claude" and self.summary_max_usd <= 0:
             raise HandoffError("The per-call summary limit must be positive.")
 
     def as_args(self, claude_dir: Path, *, dry_run: bool) -> SimpleNamespace:
         """The attribute set the shared converter takes."""
         return SimpleNamespace(
-            mode=self.mode, keep_developer=self.keep_developer, no_banner=False,
+            mode=self.mode, keep_developer=self.keep_developer,
+            no_banner=not self.include_banner,
             no_group_scratch=not self.group_scratch, context_budget=self.context_budget,
             max_tool_chars=self.max_tool_chars, summary_mode=self.summary_mode,
-            summary_file=None, summary_tokens=self.summary_tokens,
+            summary_file=self.summary_file if self.summary_mode == "file" else None,
+            summary_tokens=self.summary_tokens,
             summary_model=self.summary_model, summary_max_usd=self.summary_max_usd,
             summary_max_calls=self.summary_max_calls, title_prefix=self.title_prefix,
             claude_dir=str(claude_dir), dry_run=dry_run, replace=False)
@@ -151,6 +157,7 @@ class _Outcome:
     follow_up: list[str] = field(default_factory=list)
     status: str = "committed"
     title: str = ""
+    merged_range: tuple[int, int] | None = None     # transcript bytes a merge added
 
 
 def _sha(path: Path) -> str:
@@ -168,7 +175,7 @@ def _stamp() -> str:
 class HandoffEngine:
     def __init__(self, roots: Roots, store: Store, discovery: Discovery, lineage: Lineage,
                  bridge_factory: Callable[[], CodexBridge] | None = None,
-                 version_probe: Callable[[], str] = ci.claude_version,
+                 version_probe: Callable[[], str] = converter.claude_version,
                  desktop_probe: Callable[[], bool] = desktop_register.desktop_running):
         self.roots = roots
         self.store = store
@@ -221,13 +228,13 @@ class HandoffEngine:
         if source.path is not None and Path(source.path).is_file():
             plan.source_state = scan.file_state(Path(source.path))
         # Only a strategy that writes into the existing peer depends on it staying put.
-        if (chosen in ("append", "replace", "native_refresh", "delta_refresh")
+        if (chosen in ("append", "merge", "replace", "native_refresh", "delta_refresh")
                 and plan.dest_path and Path(plan.dest_path).is_file()):
             plan.dest_state = scan.file_state(Path(plan.dest_path))
         if plan.can_execute:
             try:
                 self._measure(plan, sessions)
-            except (ci.ImportSkipped, ValueError, OSError, RuntimeError) as err:
+            except (converter.ImportSkipped, ValueError, OSError, RuntimeError) as err:
                 plan.blocked = f"This conversation cannot be converted: {err}"
         return plan
 
@@ -269,6 +276,15 @@ class HandoffEngine:
                                 caution="Disabled: the histories have diverged or changed, and "
                                         "appending would merge them silently.")
         cont.recommended = state is not SyncState.AMBIGUOUS
+        if state is SyncState.BOTH_ADVANCED:
+            # Never recommended, so it only happens when someone picks it.
+            merge = StrategyOption(
+                "merge", "Merge the new Codex turns into the Claude session",
+                f"Adds them to the end of {a.peer_key[1][:8]}, after Claude's own newer turns and "
+                "after a backup. Nothing already in it changes.",
+                caution="Claude will read both branches as one conversation, even where they "
+                        "disagree. Claude's turns still haven't reached Codex.")
+            return [cont, append, merge, none]
         return [cont, append, none]
 
     def _claude_strategies(self, s: Session, a: Assessment, sessions: dict) -> list[StrategyOption]:
@@ -365,7 +381,7 @@ class HandoffEngine:
             plan.blocked = "The source file is missing, so nothing can be transferred."
             return
         peer = sessions.get(assessment.peer_key) if assessment.peer_key else None
-        if plan.strategy in ("append", "replace", "native_refresh", "delta_refresh") and peer is not None:
+        if plan.strategy in ("append", "merge", "replace", "native_refresh", "delta_refresh") and peer is not None:
             if peer.active:
                 plan.blocked = (f"The destination session is in use ({peer.active_reason}). "
                                 "Close it first: changing an open session can lose work.")
@@ -390,10 +406,13 @@ class HandoffEngine:
                                          "command may still be running or may have been cut off.")
             except OSError:
                 pass
-        if plan.target is CLAUDE and plan.strategy in ("append", "replace") and self.desktop_probe():
+        if plan.strategy == "merge":
+            plan.warnings.append("This merges two diverged histories into one Claude session. "
+                                 "Choose a separate continuation if you want them kept apart.")
+        if plan.target is CLAUDE and plan.strategy in ("append", "merge", "replace") and self.desktop_probe():
             plan.warnings.append("Claude Desktop is running. A session it has open keeps a cached "
                                  "copy; relaunch it before continuing this session.")
-        if plan.options.summary_mode == "claude" and plan.strategy not in ("append", "native_import", "native_refresh"):
+        if plan.options.summary_mode == "claude" and plan.strategy not in ("append", "merge", "native_import", "native_refresh"):
             plan.warnings.append(
                 f"AI summary authorization required: this sends earlier transcript excerpts to "
                 f"Claude using the {plan.options.summary_model} model, with up to "
@@ -410,20 +429,24 @@ class HandoffEngine:
             entry = None
             if strategy == "replace":
                 entry = self._ledger_entry_for(plan)
-            built = ci.build_import(plan.source.raw, plan.options.as_args(
+            built = converter.build_import(plan.source.raw, plan.options.as_args(
                 self.roots.claude_projects, dry_run=True), self.version_probe(),
                 replace_entry=entry, extra_banner=self._continuation_note(plan))
             self._apply_built(plan, built)
             if strategy != "replace":
                 # A new session's id is minted when it is written.
                 plan.dest_id = ""
-                plan.dest_path = str(self.roots.claude_projects / ci.slug_for(built["cwd"]))
-        elif strategy == "append":
+                plan.dest_path = str(self.roots.claude_projects / converter.slug_for(built["cwd"]))
+        elif strategy in ("append", "merge"):
+            if strategy == "merge" and self._claude_position(plan)[1] is None:
+                plan.blocked = ("There is no recorded position in the Claude session, so its own "
+                                "turns couldn't be told apart afterwards. Use a continuation.")
+                return
             records, problem = self._codex_new_records(plan)
             if problem:
                 plan.blocked = problem
                 return
-            res = ci.append_codex_records(
+            res = converter.append_codex_records(
                 plan.source.raw, records, 0, Path(plan.dest_path), mode=self._append_mode(plan),
                 keep_developer=plan.options.keep_developer, version=self.version_probe(),
                 dry_run=True, transform=self._bounder(plan))
@@ -501,10 +524,14 @@ class HandoffEngine:
                 f"{a.state.label}. {a.detail}")
 
     def _ledger_entry_for(self, plan: HandoffPlan) -> dict:
-        entry = ci.load_ledger().get(plan.source.session_id)
+        entry = converter.load_ledger().get(plan.source.session_id)
         if entry and entry.get("claudeSessionId") == plan.dest_id:
             return entry
         return {"claudeSessionId": plan.dest_id, "transcript": plan.dest_path}
+
+    def _claude_position(self, plan: HandoffPlan) -> tuple[str, int | None, str | None]:
+        link = plan.assessment.link
+        return link.position(link.side(CLAUDE, plan.dest_id))
 
     def _codex_new_records(self, plan: HandoffPlan) -> tuple[list[tuple[int, dict]], str]:
         link = plan.assessment.link
@@ -533,6 +560,9 @@ class HandoffEngine:
         source = plan.source
         path = Path(source.path)
         start, since = self._delta_range(plan)
+        # Turns a merge brought from Codex are not Claude's work, so they aren't sent back.
+        link = plan.assessment.link
+        merged = (link.meta.get("merged_ranges", []) if link and plan.strategy != "delta_full" else [])
         earlier: list[dict] = []
         chain: list[dict] = []
         end = 0
@@ -541,7 +571,8 @@ class HandoffEngine:
             if rec.get("isSidechain") or rec.get("type") not in ("user", "assistant"):
                 continue
             ts = rec.get("timestamp") or ""
-            if pos <= start or (since and ts and ts <= since):
+            if (pos <= start or (since and ts and ts <= since)
+                    or any(first < pos <= last for first, last in merged)):
                 earlier.append(rec)
             elif not rec.get("isMeta"):
                 chain.append(rec)
@@ -598,6 +629,8 @@ class HandoffEngine:
                                       max_calls=options.summary_max_calls,
                                       thread_id=source.session_id)
             summary.update(ai)
+        elif options.summary_mode == "file":
+            body = Path(options.summary_file).read_text(encoding="utf-8")
         elif options.summary_mode != "off":
             body = offline_digest(turns, max_tokens=options.summary_tokens)
             if options.summary_mode == "claude":
@@ -662,8 +695,8 @@ class HandoffEngine:
             report.status = "cancelled"
             report.error = str(err)
             return self._finish(transfer_id, report)
-        except (HandoffError, ci.ImportSkipped, OSError, RuntimeError, ValueError,
-                CodexUnavailable, SystemExit) as err:
+        except (HandoffError, converter.ImportSkipped, OSError, RuntimeError, ValueError,
+                CodexUnavailable) as err:
             report.error = str(err)
             log.exception("handoff failed")
             self._finish(transfer_id, report)
@@ -687,7 +720,7 @@ class HandoffEngine:
                 raise HandoffError("The destination session changed since this preview. Nothing "
                                    "was written. Preview again to see how it moved.")
         peer = sessions.get(plan.assessment.peer_key) if plan.assessment.peer_key else None
-        if plan.strategy in ("append", "replace") and peer is not None:
+        if plan.strategy in ("append", "merge", "replace") and peer is not None:
             if peer.key[1] in self.discovery.live_claude_sessions():
                 raise HandoffError("The destination session is now running in Claude Code. "
                                    "Close it, then preview again.")
@@ -696,7 +729,7 @@ class HandoffEngine:
         strategy = plan.strategy
         if strategy in ("new_session", "continuation"):
             return self._run_new_claude(plan, say, cancel)
-        if strategy == "append":
+        if strategy in ("append", "merge"):
             return self._run_append(plan, say, cancel)
         if strategy == "replace":
             return self._run_replace(plan, say, cancel)
@@ -712,23 +745,23 @@ class HandoffEngine:
         args = plan.options.as_args(self.roots.claude_projects, dry_run=False)
         say("Converting the conversation" + (" and summarizing earlier turns"
                                              if plan.options.summary_mode == "claude" else ""))
-        built = ci.build_import(s, args, self.version_probe(),
+        built = converter.build_import(s, args, self.version_probe(),
                                 extra_banner=self._continuation_note(plan))
         self._check_cancel(cancel)
-        target = self.roots.claude_projects / ci.slug_for(built["cwd"]) / f"{built['conv'].session_id}.jsonl"
+        target = self.roots.claude_projects / converter.slug_for(built["cwd"]) / f"{built['conv'].session_id}.jsonl"
         if target.exists():
             raise HandoffError(f"Refusing to overwrite an existing transcript: {target}")
         self._backup_ledger()
         say("Writing the Claude transcript")
-        ci.write_import(target, built["lines"])
+        converter.write_import(target, built["lines"])
         problems = self._validate_written(target, 0, None)
         if problems:
             self._quarantine(target)
             raise HandoffError(f"The written transcript failed validation: {problems[:3]}")
         card = self._register(plan, built, target)
-        ledger = ci.load_ledger()
-        ledger[s["id"]] = ci.ledger_entry(s, built, target, card, args)
-        ci.save_ledger(ledger)
+        ledger = converter.load_ledger()
+        ledger[s["id"]] = converter.ledger_entry(s, built, target, card, args)
+        converter.save_ledger(ledger)
         return _Outcome(
             dest_id=built["conv"].session_id, dest_path=str(target),
             relation="continuation" if plan.strategy == "continuation" else "import",
@@ -747,8 +780,8 @@ class HandoffEngine:
         if problem:
             raise HandoffError(problem)
         active = s["path"]
-        data = ci.rollout_bytes(active)
-        parsed = ci.records_from(data)
+        data = converter.rollout_bytes(active)
+        parsed = converter.records_from(data)
         consumed = parsed[-1][0] if parsed else 0
         digest = hashlib.sha256(data[:consumed]).hexdigest()
         self._check_cancel(cancel)
@@ -756,7 +789,7 @@ class HandoffEngine:
         native = not self.discovery.claude_scan(target).get("provenance")
         say("Appending the new turns")
         self._backup_ledger()
-        res = ci.append_codex_records(
+        res = converter.append_codex_records(
             s, records, 0, target, mode=self._append_mode(plan),
             keep_developer=plan.options.keep_developer, version=self.version_probe(),
             native=native, digest_of=lambda _end: digest, transform=self._bounder(plan))
@@ -770,7 +803,7 @@ class HandoffEngine:
             self._restore(target, backup, res)
             raise HandoffError(f"The append failed validation and was undone: {problems[:3]}")
         now = now_iso()
-        ledger = ci.load_ledger()
+        ledger = converter.load_ledger()
         entry = ledger.setdefault(s["id"], {
             "claudeSessionId": res["sessionId"], "card": None, "cwd": res["tail"]["cwd"],
             "title": res["tail"]["title"] or s["first_user"], "importedAt": now,
@@ -778,15 +811,20 @@ class HandoffEngine:
         entry.update({"transcript": str(target), "syncedAt": now, "sourceRollout": str(active),
                       "sourceSha256": digest, "sourceBytes": consumed,
                       "sourceMtime": int(Path(active).stat().st_mtime),
-                      "transcriptBytes": target.stat().st_size, "toolVersion": ci.TOOL_VERSION})
+                      "toolVersion": converter.TOOL_VERSION})
         # Only when appending to the session that ledger entry names; else keep it.
         if entry.get("claudeSessionId") == res["sessionId"]:
-            ci.save_ledger(ledger)
-        desktop_register.touch(res["sessionId"], ci.ms_of(res["last"]), res["stats"]["user"])
+            converter.save_ledger(ledger)
+        desktop_register.touch(res["sessionId"], converter.ms_of(res["last"]), res["stats"]["user"])
+        size_after = target.stat().st_size
+        merging = plan.strategy == "merge"
         return _Outcome(
             dest_id=plan.dest_id, dest_path=str(target), relation=link.relation,
             backup=str(backup), src_pos=(str(active), consumed, digest),
-            dst_pos=(str(target), target.stat().st_size, _sha(target)), stats=dict(res["stats"]),
+            # A merge leaves Claude's checkpoint alone: its own turns still haven't reached Codex.
+            dst_pos=self._claude_position(plan) if merging else (str(target), size_after, _sha(target)),
+            merged_range=(size_before, size_after) if merging else None,
+            stats=dict(res["stats"]),
             new_human=res["stats"]["user"], new_assistant=res["stats"]["assistant"],
             validation=["Original transcript bytes verified unchanged before the new turns.",
                         "New records chain onto the session's last message.",
@@ -797,21 +835,21 @@ class HandoffEngine:
         s = plan.source.raw
         target = Path(plan.dest_path)
         entry = self._ledger_entry_for(plan)
-        ci.verify_replace_target(target, {**entry, "claudeSessionId": plan.dest_id},
+        converter.verify_replace_target(target, {**entry, "claudeSessionId": plan.dest_id},
                                  str(self.roots.claude_projects))
         say("Rebuilding the bounded session")
         args = plan.options.as_args(self.roots.claude_projects, dry_run=False)
-        built = ci.build_import(s, args, self.version_probe(), replace_entry=entry)
+        built = converter.build_import(s, args, self.version_probe(), replace_entry=entry)
         self._check_cancel(cancel)
         self._backup_ledger()
-        backup = ci.write_import(target, built["lines"], replace=True)
+        backup = converter.write_import(target, built["lines"], replace=True)
         problems = self._validate_written(target, 0, None)
         if problems:
-            ci.atomic_write_bytes(target, Path(backup).read_bytes())
+            converter.atomic_write_bytes(target, Path(backup).read_bytes())
             raise HandoffError(f"The rebuilt transcript failed validation and was restored: {problems[:3]}")
-        ledger = ci.load_ledger()
-        ledger[s["id"]] = ci.ledger_entry(s, built, target, None, args)
-        ci.save_ledger(ledger)
+        ledger = converter.load_ledger()
+        ledger[s["id"]] = converter.ledger_entry(s, built, target, None, args)
+        converter.save_ledger(ledger)
         return _Outcome(
             dest_id=plan.dest_id, dest_path=str(target), relation="import", backup=str(backup),
             src_pos=(str(s["path"]), built["consumed"], built["digest"]),
@@ -825,10 +863,10 @@ class HandoffEngine:
             return None
         s = plan.source.raw
         return desktop_register.register(
-            built["conv"].session_id, built["cwd"], built["title"], created_ms=ci.ms_of(s["ts"]),
+            built["conv"].session_id, built["cwd"], built["title"], created_ms=converter.ms_of(s["ts"]),
             turns=built["conv"].stats["user"],
-            provenance={"source": ci.IMPORT_MARK, "codexThreadId": s["id"],
-                        "codexRollout": str(s["path"]), "importToolVersion": ci.TOOL_VERSION})
+            provenance={"source": converter.IMPORT_MARK, "codexThreadId": s["id"],
+                        "codexRollout": str(s["path"]), "importToolVersion": converter.TOOL_VERSION})
 
     # -- Claude -> Codex -----------------------------------------------------------------
     def _run_native(self, plan: HandoffPlan, sessions: dict, say, cancel) -> _Outcome:
@@ -868,14 +906,14 @@ class HandoffEngine:
                                    "Use a continuation thread instead.")
             delta_file = self.roots.handoff_project / archived.name
             shutil.copy2(archived, delta_file)
-            tail = ci.transcript_tail(delta_file)
+            tail = converter.transcript_tail(delta_file)
             lines = self._delta_lines(built["records"], "", delta_file.stem, source, tail["leaf"], plan)
-            ci.durable_append(delta_file, ci.jsonl_bytes(lines))
+            converter.durable_append(delta_file, converter.jsonl_bytes(lines))
         else:
             delta_id = str(uuid.uuid4())
             delta_file = self.roots.handoff_project / f"{delta_id}.jsonl"
             lines = self._delta_lines(built["records"], built["note"], delta_id, source, None, plan)
-            ci.atomic_write_bytes(delta_file, ci.jsonl_bytes(lines))
+            converter.atomic_write_bytes(delta_file, converter.jsonl_bytes(lines))
         self._check_cancel(cancel)
         say("Running Codex's importer on the handoff file")
         try:
@@ -898,7 +936,7 @@ class HandoffEngine:
         tool's input and output are bounded when a context budget is set."""
         out: list[str] = []
         prev = parent
-        first_ts = records[0].get("timestamp") if records else ci.iso(None)
+        first_ts = records[0].get("timestamp") if records else converter.iso(None)
         if note:
             prev = str(uuid.uuid4())
             out.append(json.dumps({
@@ -940,7 +978,7 @@ class HandoffEngine:
         if not files:
             raise HandoffError(f"Codex reports thread {thread_id}, but its rollout was not found.")
         newest = max(files, key=lambda p: p.name)
-        info = scan.scan_rollout_bytes(ci.rollout_bytes(newest))
+        info = scan.scan_rollout_bytes(converter.rollout_bytes(newest))
         checks = []
         if info["import_end"] is None:
             raise HandoffError(f"Thread {thread_id} has no completed import marker, so the "
@@ -985,12 +1023,12 @@ class HandoffEngine:
                     continue
                 if rec.get("type") in ("user", "assistant"):
                     chain.append(rec)
-        problems.extend(ci.validate(chain, root=root))
+        problems.extend(converter.validate(chain, root=root))
         return problems
 
     def _restore(self, target: Path, backup: Path | None, res: dict) -> None:
         if backup and Path(backup).is_file():
-            ci.atomic_write_bytes(target, Path(backup).read_bytes())
+            converter.atomic_write_bytes(target, Path(backup).read_bytes())
 
     def _quarantine(self, target: Path) -> None:
         """A file this operation created that failed checks: kept aside, never deleted."""
@@ -1009,7 +1047,7 @@ class HandoffEngine:
         ledger = self.roots.claude_ledger
         if ledger.is_file():
             self.roots.backups_dir.mkdir(parents=True, exist_ok=True)
-            ci.atomic_write_bytes(self.roots.backups_dir / f"codex-imports-{_stamp()}.json",
+            converter.atomic_write_bytes(self.roots.backups_dir / f"codex-imports-{_stamp()}.json",
                                   ledger.read_bytes())
 
     def _apply_outcome(self, plan: HandoffPlan, outcome: _Outcome, report: HandoffReport,
@@ -1017,7 +1055,7 @@ class HandoffEngine:
         source = plan.source
         if outcome.status == "committed":
             link = plan.assessment.link if plan.strategy in (
-                "append", "replace", "native_refresh", "delta_refresh") else None
+                "append", "merge", "replace", "native_refresh", "delta_refresh") else None
             if link is None:
                 link = self.store.find_link((source.provider, source.session_id),
                                             (plan.target, outcome.dest_id))
@@ -1034,7 +1072,9 @@ class HandoffEngine:
             link.origin = "contextbridge"
             if outcome.delta_path:
                 link.delta_path = outcome.delta_path
-            if outcome.budget or (link.bounded and plan.strategy == "append"):
+            if outcome.merged_range:
+                link.meta.setdefault("merged_ranges", []).append(list(outcome.merged_range))
+            if outcome.budget or (link.bounded and plan.strategy in ("append", "merge")):
                 link.bounded = True
             link.meta.update({"mode": plan.options.mode, "contextBudget": plan.options.context_budget,
                               "summaryMode": plan.options.summary_mode})

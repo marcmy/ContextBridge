@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-import codex_import as ci
+from . import converter, desktop_register
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,7 @@ class Roots:
     codex_home: Path
     claude_home: Path
     app_home: Path
+    desktop_support: Path | None = None   # Claude Desktop's data folder
 
     @classmethod
     def default(cls) -> "Roots":
@@ -26,7 +27,12 @@ class Roots:
 
     def activate(self) -> None:
         """Point the shared converter at these roots."""
-        ci.configure_paths(self.codex_home, self.claude_home)
+        converter.configure_paths(self.codex_home, self.claude_home)
+        # Another Claude home must never be compared with the real desktop session cards.
+        support = self.desktop_support
+        if support is None and self.claude_home != Roots.default().claude_home:
+            support = self.app_home / "no-desktop"
+        desktop_register.configure_paths(support)
 
     # -- Codex ---------------------------------------------------------------------
     @property

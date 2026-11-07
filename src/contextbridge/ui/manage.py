@@ -4,50 +4,26 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices
-from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QHeaderView, QMessageBox, QPushButton,
-                               QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget)
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import QHBoxLayout, QMessageBox, QPushButton, QTabWidget, QVBoxLayout, QWidget
 
 from ..models import DuplicateCandidate, Provider
 from ..service import CleanupRefused, ContextBridge, Snapshot
 from .details import label
+from .maintenance import BulkPanel, DesktopPanel, ImportsPanel
+from .manage_table import cell, table
 from .theme import colors, provider_color
 from .workers import run_task
 
 STATUS_TEXT = {"committed": "Completed", "failed": "Failed", "cancelled": "Cancelled",
                "writing": "In progress", "interrupted": "Interrupted",
                "assisted_pending": "Waiting on Codex"}
-STRATEGY_TEXT = {"new_session": "New session", "append": "Append new turns", "replace": "Rebuild in place",
+STRATEGY_TEXT = {"new_session": "New session", "append": "Append new turns", "merge": "Merge diverged turns", "replace": "Rebuild in place",
                  "continuation": "Separate continuation", "native_import": "Codex importer",
                  "native_refresh": "Codex importer update", "delta_import": "Handoff (new work only)",
                  "delta_full": "Whole session", "delta_refresh": "Handoff update"}
 KIND_TEXT = {"circular_copy": "Circular re-import", "repeat_import": "Imported twice",
              "content_overlap": "Same opening turns", "internal_import": "Import of an internal agent"}
-
-
-def table(headers: list[str], stretch: int) -> QTableWidget:
-    widget = QTableWidget(0, len(headers))
-    widget.setHorizontalHeaderLabels(headers)
-    widget.verticalHeader().setVisible(False)
-    widget.setShowGrid(False)
-    widget.setSelectionBehavior(QAbstractItemView.SelectRows)
-    widget.setSelectionMode(QAbstractItemView.SingleSelection)
-    widget.setEditTriggers(QAbstractItemView.NoEditTriggers)
-    widget.setWordWrap(False)
-    header = widget.horizontalHeader()
-    header.setSectionResizeMode(QHeaderView.ResizeToContents)
-    header.setSectionResizeMode(stretch, QHeaderView.Stretch)
-    return widget
-
-
-def cell(text: str, color: str | None = None, tip: str | None = None, data=None) -> QTableWidgetItem:
-    item = QTableWidgetItem(text)
-    if color:
-        item.setForeground(QColor(color))
-    item.setToolTip(tip or text)
-    if data is not None:
-        item.setData(Qt.UserRole, data)
-    return item
 
 
 class ManagePage(QWidget):
@@ -115,14 +91,35 @@ class ManagePage(QWidget):
         box.addLayout(row)
         self.tabs.addTab(archived, "Archived")
 
+        self.imports = ImportsPanel(bridge)
+        self.imports.changed.connect(self.changed)
+        self.imports.show_session.connect(self.show_session)
+        self.tabs.addTab(self.imports, "Import health")
+        self.bulk = BulkPanel(bridge)
+        self.bulk.changed.connect(self.changed)
+        self.tabs.addTab(self.bulk, "Bulk import")
+        self.desktop = DesktopPanel(bridge)
+        self.desktop.changed.connect(self.changed)
+        self.tabs.addTab(self.desktop, "Claude Desktop")
+        self.tabs.currentChanged.connect(self._tab_opened)
+        self._opened: set[QWidget] = set()
+
     def fill(self, snapshot: Snapshot) -> None:
         self.snapshot = snapshot
         self._fill_transfers(snapshot.transfers)
         self._fill_duplicates(snapshot.duplicates)
         self._fill_archived(snapshot.archived)
+        self.bulk.fill(snapshot)
         count = len(snapshot.duplicates)
         self.tabs.setTabText(1, f"Duplicates ({count})" if count else "Duplicates")
         self.tabs.setTabText(2, f"Archived ({len(snapshot.archived)})" if snapshot.archived else "Archived")
+
+    def _tab_opened(self, _index: int) -> None:
+        """These read many files, so they run the first time their tab is opened."""
+        page = self.tabs.currentWidget()
+        if page in (self.imports, self.desktop) and page not in self._opened:
+            self._opened.add(page)
+            page.check()
 
     def _fill_transfers(self, rows: list[dict]) -> None:
         c = colors()

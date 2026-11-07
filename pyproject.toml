@@ -16,14 +16,12 @@ gui = ["PySide6-Essentials>=6.10"]
 
 [project.scripts]
 contextbridge = "contextbridge.__main__:main"
-codex-import = "codex_import:main"
 
 [project.gui-scripts]
 contextbridge-gui = "contextbridge.__main__:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
-py-modules = ["codex_import", "context_budget", "desktop_register", "history_summary"]
 packages = ["contextbridge", "contextbridge.ui"]
 
 [tool.setuptools.package-data]

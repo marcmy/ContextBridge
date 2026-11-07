@@ -1,6 +1,5 @@
 __pycache__/
 *.pyc
-imported.json
 .venv/
 build/
 dist/

@@ -9,8 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-import context_budget as cb
-import history_summary as hs
+from contextbridge import context_budget as cb
+from contextbridge import history_summary as hs
 
 
 def rec(kind, text="", *, uid=None, meta=False):

@@ -19,13 +19,23 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-import contextbridge  # noqa: E402,F401
-import codex_import as ci  # noqa: E402
+from contextbridge import converter, desktop_register  # noqa: E402
 from contextbridge.codex_bridge import NativeImportResult  # noqa: E402
 from contextbridge.handoff import HandoffOptions  # noqa: E402
 from contextbridge.models import Provider  # noqa: E402
 from contextbridge.paths import Roots  # noqa: E402
 from contextbridge.service import ContextBridge  # noqa: E402
+
+
+def external_import_end(recs: list[tuple[int, dict]]) -> int | None:
+    """Offset past the last turn Codex replayed from a Claude session."""
+    end = None
+    for off, rec in recs:
+        payload = rec.get("payload") or {}
+        if (rec.get("type") == "event_msg" and payload.get("type") == "task_complete"
+                and str(payload.get("turn_id", "")).startswith(converter.EXTERNAL_TURN_PREFIX)):
+            end = off
+    return end
 
 
 class Clock:
@@ -62,7 +72,7 @@ class FakeCodexBridge:
         digest = hashlib.sha256(data).hexdigest()
         ledger = self.box.read_codex_ledger()
         record = next((r for r in ledger["records"]
-                       if ci.normalize_path(r["source_path"]) == str(path)), None)
+                       if converter.normalize_path(r["source_path"]) == str(path)), None)
         records = [json.loads(line) for line in data.splitlines() if line.strip()]
         chain = [r for r in records if r.get("type") in ("user", "assistant")
                  and not r.get("isSidechain") and not r.get("isMeta")]
@@ -76,10 +86,10 @@ class FakeCodexBridge:
             thread = record["imported_thread_id"]
             rollout = self.box.rollout_path(thread)
             scanned = rollout.read_bytes()
-            end = ci.external_import_end(ci.records_from(scanned))
-            if ci.records_from(scanned, end or 0):
+            end = external_import_end(converter.records_from(scanned))
+            if converter.records_from(scanned, end or 0):
                 return NativeImportResult("no_change")
-            done = sum(1 for r in ci.records_from(scanned)
+            done = sum(1 for r in converter.records_from(scanned)
                        if r[1].get("type") == "response_item"
                        and (r[1].get("payload") or {}).get("type") == "message")
         rows = []
@@ -92,19 +102,19 @@ class FakeCodexBridge:
                     if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
                         continue
                     content = "\n".join(b.get("text", "") for b in content)
-                rows.append(self.box.ev_task_started(f"{ci.EXTERNAL_TURN_PREFIX}-{turn}"))
+                rows.append(self.box.ev_task_started(f"{converter.EXTERNAL_TURN_PREFIX}-{turn}"))
                 rows.append(self.box.ev_user(content))
-                rows.append(self.box.ev_done(f"{ci.EXTERNAL_TURN_PREFIX}-{turn}"))
+                rows.append(self.box.ev_done(f"{converter.EXTERNAL_TURN_PREFIX}-{turn}"))
                 turn += 1
             else:
                 text = "\n".join(b.get("text", "") for b in content if isinstance(b, dict)
                                  and b.get("type") == "text") if isinstance(content, list) else str(content)
                 if text:
                     rows.append(self.box.ev_assistant(text))
-                    rows.append(self.box.ev_done(f"{ci.EXTERNAL_TURN_PREFIX}-{turn - 1}"))
+                    rows.append(self.box.ev_done(f"{converter.EXTERNAL_TURN_PREFIX}-{turn - 1}"))
         self.box.append_rollout(thread, rows)
         ledger["records"] = [r for r in ledger["records"]
-                             if ci.normalize_path(r["source_path"]) != str(path)]
+                             if converter.normalize_path(r["source_path"]) != str(path)]
         ledger["records"].append({
             "source_path": "\\\\?\\" + str(path) if sys.platform == "win32" else str(path),
             "content_sha256": digest, "imported_thread_id": thread, "imported_at": 1793902720,
@@ -133,22 +143,38 @@ class Sandbox:
         (self.claude_home / "projects").mkdir(parents=True)
         self.codex_ledger = self.codex_home / "external_agent_session_imports.json"
         self.claude_ledger = self.claude_home / "codex-imports.json"
+        self.desktop_support = self.root / "desktop"
         self.clock = Clock()
         self.counter = 0
         self.bridge = FakeCodexBridge(self)
-        self.original = (ci.CODEX_SESSIONS, ci.CODEX_IMPORT_LEDGER, ci.CLAUDE_PROJECTS,
-                         ci.LEDGER, ci.BACKUPS)
+        self.original = (converter.CODEX_SESSIONS, converter.CODEX_IMPORT_LEDGER, converter.CLAUDE_PROJECTS,
+                         converter.LEDGER, converter.BACKUPS)
 
     def app(self, **kw) -> ContextBridge:
-        roots = Roots(self.codex_home, self.claude_home, self.app_home)
+        roots = Roots(self.codex_home, self.claude_home, self.app_home, self.desktop_support)
         kw.setdefault("version_probe", lambda: "2.1.300")
         kw.setdefault("desktop_probe", lambda: False)
         return ContextBridge(roots, bridge_factory=lambda: self.bridge, **kw)
 
     def close(self) -> None:
-        (ci.CODEX_SESSIONS, ci.CODEX_IMPORT_LEDGER, ci.CLAUDE_PROJECTS,
-         ci.LEDGER, ci.BACKUPS) = self.original
+        (converter.CODEX_SESSIONS, converter.CODEX_IMPORT_LEDGER, converter.CLAUDE_PROJECTS,
+         converter.LEDGER, converter.BACKUPS) = self.original
+        desktop_register.configure_paths(None)
         self._tmp.cleanup()
+
+    # -- Claude Desktop ------------------------------------------------------------------
+    def desktop_card(self, account: str, workspace: str, cli_id: str, title: str = "A session",
+                     **fields) -> Path:
+        reg = self.desktop_support / "claude-code-sessions" / account / workspace
+        reg.mkdir(parents=True, exist_ok=True)
+        path = reg / f"local_{uuid.uuid4()}.json"
+        path.write_text(json.dumps({"sessionId": path.stem, "cliSessionId": cli_id, "title": title,
+                                    **fields}), encoding="utf-8")
+        return path
+
+    def set_active_account(self, account: str) -> None:
+        (self.desktop_support / "config.json").write_text(
+            json.dumps({"lastKnownAccountUuid": account}), encoding="utf-8")
 
     # -- Codex side ----------------------------------------------------------------------
     def new_thread_id(self) -> str:
@@ -204,7 +230,7 @@ class Sandbox:
                 fh.write(json.dumps(row, ensure_ascii=False).encode("utf-8") + b"\n")
 
     def rollout_records(self, thread: str) -> list[dict]:
-        return ci.read_rollout(self.rollout_path(thread))
+        return [rec for _, rec in converter.records_from(converter.rollout_bytes(self.rollout_path(thread)))]
 
     def codex_turn(self, thread: str, human: str, answer: str, *, tool: bool = False) -> None:
         """A native Codex turn."""
@@ -235,7 +261,7 @@ class Sandbox:
 
     # -- Claude side ---------------------------------------------------------------------
     def claude_path(self, sid: str, cwd=None) -> Path:
-        slug = ci.slug_for(str(cwd or self.project))
+        slug = converter.slug_for(str(cwd or self.project))
         return self.claude_home / "projects" / slug / f"{sid}.jsonl"
 
     def claude_session(self, *turns: tuple[str, str], sid: str | None = None, cwd=None) -> str:
@@ -248,7 +274,7 @@ class Sandbox:
         return sid
 
     def _claude_tail(self, path: Path) -> str | None:
-        return ci.transcript_tail(path)["leaf"]
+        return converter.transcript_tail(path)["leaf"]
 
     def claude_turn(self, sid: str, human: str, answer: str, cwd=None, path: Path | None = None) -> None:
         """A live Claude Code turn; note the fields live records have and converted ones lack."""
@@ -294,7 +320,7 @@ class Sandbox:
         for rec in self.rollout_records(thread):
             p = rec.get("payload") or {}
             if rec.get("type") == "response_item" and p.get("type") == "message" and p.get("role") == "user":
-                out.append(ci.text_of(p.get("content")))
+                out.append(converter.text_of(p.get("content")))
         return out
 
 

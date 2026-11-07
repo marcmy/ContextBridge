@@ -9,7 +9,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-import codex_import as ci
+from . import converter
 
 from . import scan
 from .models import Provider, Session
@@ -32,7 +32,7 @@ def project_root(cwd: str, cache: dict[str, str] | None = None) -> str:
     The filesystem is the only input: two conversations in one repository share a
     project, which says nothing about them being the same conversation.
     """
-    cwd = ci.group_scratch(ci.normalize_path(cwd))
+    cwd = converter.group_scratch(converter.normalize_path(cwd))
     if not cwd:
         return ""
     if cache is not None and cwd in cache:
@@ -67,7 +67,7 @@ class RolloutIndex:
                 continue
             for dirpath, _dirs, names in os.walk(base):
                 for name in names:
-                    match = ci.ROLLOUT_RE.match(name)
+                    match = converter.ROLLOUT_RE.match(name)
                     if not match:
                         continue
                     full = Path(dirpath) / name
@@ -76,7 +76,7 @@ class RolloutIndex:
                     if rid not in self.paths or name.endswith(".jsonl"):
                         self.paths[rid] = full
                     self.by_thread.setdefault(match.group(1), [])
-                    if not any(ci.same_rollout(p, full) for p in self.by_thread[match.group(1)]):
+                    if not any(converter.same_rollout(p, full) for p in self.by_thread[match.group(1)]):
                         self.by_thread[match.group(1)].append(full)
 
     def get(self, rollout_id):
@@ -86,7 +86,7 @@ class RolloutIndex:
         summary = None
         if path:
             try:
-                summary = ci.summarize(path)
+                summary = converter.summarize(path)
             except (OSError, EOFError, ValueError, RuntimeError) as err:
                 log.warning("unreadable rollout %s: %s", path, err)
         self._summaries[rollout_id] = summary
@@ -123,8 +123,8 @@ class Discovery:
         out: list[Session] = []
         seen: set[str] = set()
         for tid, row in state.items():
-            path = ci.locate_rollout(row.get("rollout_path") or "")
-            internal = ci.is_internal_session(
+            path = converter.locate_rollout(row.get("rollout_path") or "")
+            internal = converter.is_internal_session(
                 {"source": row.get("source"), "thread_source": row.get("thread_source")})
             if not path.is_file():
                 # A stale index row with nothing behind it is not a conversation.
@@ -142,20 +142,20 @@ class Discovery:
         return out
 
     def _codex_raw(self, tid: str, path: Path, row: dict | None) -> dict:
-        summary = ci.summarize(path) or {}
-        raw = {"path": path, "id": tid, "rollout_id": ci.rollout_id(path),
+        summary = converter.summarize(path) or {}
+        raw = {"path": path, "id": tid, "rollout_id": converter.rollout_id(path),
                "history_base": summary.get("history_base"),
                "forked_from": summary.get("forked_from") or "",
-               "cwd": ci.normalize_path(summary.get("cwd") or (row or {}).get("cwd") or ""),
+               "cwd": converter.normalize_path(summary.get("cwd") or (row or {}).get("cwd") or ""),
                "ts": summary.get("ts") or "", "originator": summary.get("originator") or "",
                "first_user": summary.get("first_user") or "", "lines": summary.get("lines"),
                "internal": bool(summary.get("internal")), "round_trip": ""}
-        ci.resolve_lineage(raw, self.rollouts)
+        converter.resolve_lineage(raw, self.rollouts)
         return raw
 
     def _codex_from_state(self, tid: str, row: dict, path: Path, internal: bool) -> Session:
         title = row.get("name") or row.get("title") or row.get("first_user_message") or ""
-        cwd = ci.normalize_path(row.get("cwd") or "")
+        cwd = converter.normalize_path(row.get("cwd") or "")
         return Session(
             provider=Provider.CODEX, session_id=tid, title=_clip_title(readable_title(title) or title),
             cwd=cwd, project=project_root(cwd, self._projects), path=path,
@@ -171,13 +171,13 @@ class Discovery:
     def _codex_from_files(self, tid: str, paths: list[Path]) -> Session | None:
         newest = max(paths, key=lambda p: p.name)
         try:
-            summary = ci.summarize(newest)
+            summary = converter.summarize(newest)
         except (OSError, EOFError, ValueError, RuntimeError) as err:
             log.warning("unreadable rollout %s: %s", newest, err)
             return None
         if not summary or not summary.get("id"):
             return None
-        cwd = ci.normalize_path(summary.get("cwd") or "")
+        cwd = converter.normalize_path(summary.get("cwd") or "")
         archived = self.roots.codex_archived in newest.parents
         return Session(
             provider=Provider.CODEX, session_id=tid,
@@ -218,7 +218,7 @@ class Discovery:
                  "forked_from": session.raw.get("forked_from") or ""}
         prompts: list[str] = []
         for rollout, cutoff in chain:
-            data = ci.rollout_bytes(rollout)
+            data = converter.rollout_bytes(rollout)
             part = scan.scan_rollout_bytes(data[:cutoff] if cutoff is not None else data)
             total["human"] += part["human"]
             total["assistant"] += part["assistant"]
@@ -278,7 +278,7 @@ class Discovery:
                 continue
             if not info["human"] and not info["native_assistant"] and not info["imported_assistant"]:
                 continue        # no conversation in it: an empty or tool-only shell
-            cwd = ci.normalize_path(info["cwd"])
+            cwd = converter.normalize_path(info["cwd"])
             st = path.stat()
             updated = scan.ms_of_iso(info["last_ts"]) or int(st.st_mtime * 1000)
             active = path.stem in live
@@ -328,7 +328,7 @@ _MARKUP = re.compile(r"<[^>\n]{1,300}>")
 
 def readable_title(text: str) -> str:
     """Pasted-attachment markup says nothing about what a conversation is about."""
-    return ci.clean_title(_MARKUP.sub(" ", text or "")) or _MARKUP.sub(" ", text or "").strip()
+    return converter.clean_title(_MARKUP.sub(" ", text or "")) or _MARKUP.sub(" ", text or "").strip()
 
 
 def _claude_title(info: dict) -> str:
